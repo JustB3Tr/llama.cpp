@@ -8,9 +8,13 @@ Snapshot: 2026-11-17. This is an experimental fork, not a claim that all models 
 * [DeepSeek V4.1 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) is a different multimodal 552B-backbone model, not a renamed V4 Flash. A GGUF conversion and the matching architecture and vision path must be checked separately. [tandem.cpp](https://github.com/ewhacc/tandem.cpp) reports V4.1 benchmarks using a particular 139 GiB expert quant; this is not a prediction for an RTX 4060.
 * [GLM-5.3 Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) is a different multimodal 320B / 18B-active model. [Upstream added its text architecture](https://github.com/ggml-org/llama.cpp/pull/27773); this fork's actual model, quant, text and vision compatibility remain untested.
 
+The pinned source registers distinct `deepseek4`, `deepseek41`, and `glm5-next` architectures and model implementations. Registration alone does not establish that a particular GGUF, its tokenizer, multimodal projector, or every execution path works correctly.
+
 ## What exists already
 
 This branch is based on llama.cpp `f5222f25c18da062ab2b8a2dbbfbf4feae398566` plus the locally installed tandem.cpp patch. That patch contains GPU expert caching, host expert arenas, async read paths, fault-triggered prefetch and optional router lookahead. Preserve the upstream tandem license and attribution. The exact locally installed snapshot is used here; do not assume it equals the latest GitHub version. Existing tandem code has counters for cache hits, reads, CPU work, read-ahead and faults when statistics are enabled. Check logs for activation, rather than inferring it from allocated GPU memory.
+
+At inspection time the local tandem repository HEAD was `64a6b186f650bca7638b7c5baccb118587d1f715`, with a modified patch and related files. Remote tandem HEAD was `54d03ac6424912741501785de757dcb559e29667`; remote llama.cpp HEAD was `401563f10ec60754e688cd3165c1343cf4be9642`. This branch is pinned to the local tandem base, not the current upstream tip. Porting later upstream changes requires review and renewed tests.
 
 The launcher in `tools/lowram_tandem_run.py` is adapted from tandem's launcher. The original stopped scanning GGUF metadata at the first tokenizer key. The local GGUF puts expert metadata later, causing the original to see an architecture without an expert count and treat it as dense. This copy reads the entire header, warns on missing expert counts, offers explicit GPU layer count, and warns about cache starvation on 8 GiB cards. Unknown architecture or missing metadata does not establish model compatibility. It still chooses heuristic settings; validate generated commands.
 
