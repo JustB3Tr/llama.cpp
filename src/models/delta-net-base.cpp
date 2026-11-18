@@ -393,10 +393,12 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(g->ne[0] == 1   || g->ne[0] == S_v);
     GGML_ASSERT(                   g->ne[1] == H_v && g->ne[2] == n_tokens && g->ne[3] == n_seqs);
     GGML_ASSERT(b->ne[0] == 1   && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
-    GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
+    GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && (gdn_state_ids || s->ne[3] == n_seqs));
 
     // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
-    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
+    ggml_tensor * result = gdn_state_ids || gdn_gate_dt ?
+        ggml_gated_delta_net_ext(ctx0, q, k, v, g, b, s, gdn_state_ids, gdn_gate_dt, gdn_gate_a, /*K=*/1) :
+        ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
     if (n_tokens == 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
     } else {
@@ -537,7 +539,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const int64_t S_v          = s->ne[0];
     const int64_t H_v          = s->ne[2];
-    const int64_t n_seqs       = s->ne[3];
+    const int64_t n_seqs       = v->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
 
     const bool keep = cparams.n_rs_seq > 0;
@@ -560,8 +562,40 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
 
+    // LLAMA_GDN_REPLAY: one S plane; the op replays the kept tokens, keeps up to K of this ubatch's (see ggml_gated_delta_net_replay)
+    if (mctx_cur->get_replay()) {
+        GGML_ASSERT(inp->s_rep != nullptr && n_seqs == 1 && gdn_state_ids != nullptr);
+        ggml_tensor * gdn_out = ggml_gated_delta_net_replay(ctx0, q, k, v, g, b, s, inp->s_rep, gdn_gate_dt, gdn_gate_a,
+                mctx_cur->get_x_l(il), (int) K);
+        res->add_fused_node({n_seq_tokens > 1 ? LLM_FUSED_OP_GDN_CH : LLM_FUSED_OP_GDN_AR, gdn_out, il});
+
+        ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
+            S_v, H_v, n_seq_tokens, n_seqs,
+            ggml_row_size(gdn_out->type, S_v),
+            ggml_row_size(gdn_out->type, S_v * H_v),
+            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
+            0);
+        cb(output, "attn_output", il);
+
+        // the state slot -> the S plane at kv_head (the same [D, n_seqs, 1] cpy as one snapshot, which the CUDA backend fuses)
+        const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+        ggml_tensor * src = ggml_view_3d(ctx0, gdn_out, D, n_seqs, 1,
+            ggml_row_size(gdn_out->type, D),
+            ggml_row_size(gdn_out->type, D * n_seqs),
+            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens * n_seqs));
+        ggml_tensor * dst = ggml_view_3d(ctx0, ssm_states_all, D, n_seqs, 1,
+            ssm_states_all->nb[1],
+            (size_t) mem_size * row_size,
+            (size_t) kv_head * row_size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+
+        return output;
+    }
+
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    ggml_tensor * gdn_out = gdn_state_ids || gdn_gate_dt ?
+        ggml_gated_delta_net_ext(ctx0, q, k, v, g, b, s, gdn_state_ids, gdn_gate_dt, gdn_gate_a, K) :
+        ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {

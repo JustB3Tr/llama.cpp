@@ -23,6 +23,7 @@ struct llama_prec_policy;
 struct llama_hadamard;
 
 class llama_moe_cache;
+class llama_moe_chunks;
 
 struct llama_memory_context_i;
 
@@ -166,6 +167,12 @@ public:
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd_state, n_batch]
 
+    // LLAMA_MTP_CHAIN (1-token graphs only): the graph reads these instead of tokens/h; set_input mirrors the host
+    // inputs into them unless a chain is active (then the previous step wrote them on the device)
+    ggml_tensor * chain_tok    = nullptr;
+    ggml_tensor * chain_h      = nullptr;
+    const bool  * chain_active = nullptr;
+
     const int64_t n_embd       = 0;
     const int64_t n_embd_state = 0;
 };
@@ -293,6 +300,9 @@ public:
     // and shared across layers which use build_rs
     ggml_tensor * s_copy_main; // I32 [n_seqs]
     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
+
+    // LLAMA_GDN_REPLAY: I32 [4] { S row, x row to replay, x row to write, tokens to replay } (llama_memory_recurrent_context::replay_info)
+    ggml_tensor * s_rep = nullptr;
 
     const llama_memory_recurrent_context * mctx;
 
@@ -806,6 +816,7 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    const llama_moe_chunks       * moe_chunks = nullptr;
 
     const llama_prec_policy * prec_policy = nullptr;
 
@@ -934,6 +945,12 @@ public:
     ggml_context * get_ctx() const { return ctx_compute.get(); }
 
     int64_t get_max_nodes() const;
+
+    // the MoE cache's hybrid registrations made while building this graph (set_hybrid_layer), replayed when a pooled graph is
+    // reused after another graph was built (LLAMA_GRAPH_POOL)
+    // ids non-null: a prefill share registration (set_prefill_layer), else a hybrid one (set_hybrid_layer)
+    struct moe_hyb_reg { int32_t il; ggml_tensor * x; ggml_tensor * w; int act; float limit; const ggml_tensor * ids; ggml_tensor * la; ggml_tensor * fids = nullptr; };
+    std::vector<moe_hyb_reg> moe_hyb_regs;
 
     void reset();
 
@@ -1064,6 +1081,7 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    const llama_moe_chunks       * moe_chunks = nullptr;
 
     const llama_prec_policy * prec_policy;
 
@@ -1232,7 +1250,9 @@ struct llm_graph_context {
              ggml_tensor * gate_exps,
              ggml_tensor * down_exps,
              ggml_tensor * gate_up_exps,
-                     int   il) const;
+                     int   il,
+             ggml_tensor * hyb_x = nullptr,   // doorbell mode: the expert input and router weights for the CPU, see set_hybrid_layer
+             ggml_tensor * hyb_w = nullptr) const;
 
     //
     // inputs

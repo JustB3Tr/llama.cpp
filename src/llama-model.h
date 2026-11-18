@@ -435,6 +435,8 @@ struct llama_layer {
 
     // qwen3.5
     struct ggml_tensor * ssm_alpha = nullptr;
+    // LLAMA_GDN_GATES: rows of ssm_beta then ssm_alpha, one matvec for both (see load_tensors_gdn_gates)
+    struct ggml_tensor * ssm_ba_cat = nullptr;
 
     // rwkv
     struct ggml_tensor * time_mix_w1         = nullptr;
@@ -759,6 +761,29 @@ struct llama_model {
     struct ggml_tensor * nextn_proj_pre  = nullptr;
     struct ggml_tensor * nextn_proj_post = nullptr;
 
+    // MTP draft head over a vocabulary subset (LLAMA_MTP_DRAFT_VOCAB: N first ids, or a file of int32 token ids): rows of output, and their ids
+    struct ggml_tensor * output_draft     = nullptr;
+    struct ggml_tensor * output_draft_ids = nullptr;
+
+    // LLAMA_MTP_CHAIN: device buffers that chain the 1-token MTP draft steps without host round trips. The 1-token
+    // MTP graph reads its token and h from them and writes its argmax token and h back (see llama_mtp_chain_*)
+    struct ggml_tensor * mtp_chain_tok = nullptr;          // I32 [1]
+    struct ggml_tensor * mtp_chain_h   = nullptr;          // F32 [n_embd_out]
+    struct ggml_tensor * mtp_chain_out = nullptr;          // I32 [64], the token of each chained step
+    std::vector<struct ggml_tensor *> mtp_chain_out_rows;  // views of mtp_chain_out, one per step
+    mutable bool mtp_chain_active = false;                 // while true, the graph input leaves the buffers alone
+
+    // LLAMA_PLE_GPU=1: the per-layer embedding table in host memory is registered with the GPU (pinned and mapped), and the
+    // GPU gathers its rows itself (ggml_get_rows_host): no CPU split before every ubatch
+    bool ple_host_mapped = false;
+    // where the kernel cannot pin file-backed pages (Linux 6.8: cudaHostRegister "operation not supported"), an anonymous
+    // copy of the table is registered instead and the tensor points at it; freed (unregistered, unmapped) with the model
+    std::shared_ptr<void> ple_host_copy;
+    std::shared_ptr<void> exps_host_copy;  // LLAMA_MOE_PIN_EXPS: the pinned copy of the mapped experts
+
+    // LLAMA_HC_FUSE: hyper-connection down projections whose 1/hc scale was folded into the weights at load
+    std::unordered_set<const struct ggml_tensor *> hc_scale_folded;
+
     // hrm-text initial low-cycle state
     struct ggml_tensor * hrm_z_l_init = nullptr;
 
@@ -978,6 +1003,12 @@ struct llama_model_base : public llama_model {
 
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
+    void load_tensors_draft_vocab();
+    void load_tensors_hc_fold();
+    void load_tensors_gdn_gates();
+    void load_tensors_mtp_chain();
+    void load_tensors_ple_gpu();
+    void load_tensors_exps_pin();
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);

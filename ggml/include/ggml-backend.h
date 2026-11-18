@@ -363,6 +363,8 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
+    // GGML_SCHED_BATCH_INPUTS=2: the user input copies are not waited for; call this before overwriting the inputs
+    GGML_API void                 ggml_backend_sched_wait_input_copies(ggml_backend_sched_t sched);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.

@@ -79,6 +79,19 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // LLAMA_GDN_REPLAY=1 (one sequence, gated delta net layers): instead of n_rs_seq snapshot planes of the S state, one plane
+    // (the state before the last ubatch of at most n_rs_seq + 1 tokens) plus that ubatch's per-token inputs (k, v and the raw
+    // gates, x_l: two planes, read one / write the other); the fused GDN op replays the tokens kept after a rollback at the
+    // start of the next ubatch. The R (conv) state keeps its snapshot planes.
+    bool     replay   = false;
+    uint32_t n_x_tok  = 0; // floats per token in x_l
+    std::vector<ggml_tensor *> x_l;
+    std::vector<uint32_t> row_pend;   // per data row: tokens of its last ubatch kept in x_l (0: the S plane is current)
+    std::vector<uint32_t> row_xplane; // per data row: the x_l plane holding them
+    // staged by find_slot for the cells head..head+n: the source row's pending tokens and x plane, the x plane written
+    std::vector<uint32_t> cell_pend_in;
+    std::vector<uint32_t> cell_xplane_in;
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -134,7 +147,10 @@ private:
     size_t size_p_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    // replay: rows_s are the S rows (plane 0), x_rows / x_rep the kept inputs' row and the tokens to replay, per cell
+    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+                          const std::vector<std::pair<uint32_t, uint32_t>> * rows_s = nullptr,
+                          const std::vector<uint32_t> * x_rows = nullptr, const std::vector<uint32_t> * x_rep = nullptr) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
@@ -173,6 +189,13 @@ public:
     //
 
     uint32_t get_n_rs() const;
+
+    // LLAMA_GDN_REPLAY: whether the S state replays; replay_info fills {S row, x read row, x write row, tokens to replay}
+    // for sequence 0 of the ubatch (read before s_copy, which consumes the rollback index)
+    bool          get_replay() const;
+    uint32_t      get_replay_k() const;
+    ggml_tensor * get_x_l(int32_t il) const;
+    void          replay_info(int32_t * out) const;
     uint32_t get_head() const;
     int32_t  get_rs_z() const;
     uint32_t get_size() const;

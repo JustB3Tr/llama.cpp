@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-prof.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -368,7 +369,9 @@ llama_context::llama_context(
 
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
-    cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_cache_size   = params.moe_cache_size;
+    cparams.moe_cache_margin = params.moe_cache_margin;
+    cparams.moe_cache_margin_draft = std::min(params.moe_cache_margin_draft, params.moe_cache_margin);
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -559,8 +562,148 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        if (cparams.moe_cache_size > 0 && model.split_mode() != LLAMA_SPLIT_MODE_NONE && model.split_mode() != LLAMA_SPLIT_MODE_LAYER) {
+            throw std::runtime_error("the MoE cache (--moe-cache-mib) supports --split-mode none and layer only");
+        }
+        // default 4 ranges on CUDA; LLAMA_MOE_CHUNKS=<n> also on ROCm (not yet validated there), 0 or 1 = whole tensors
+        const char * chunks_env = getenv("LLAMA_MOE_CHUNKS");
+        const int    n_chunks   = chunks_env ? atoi(chunks_env) : 4;
+        if (n_chunks > 1 && cparams.op_offload) {
+            // before the compute buffers are reserved: the ranges shrink the weight copies of the large-batch graphs
+            moe_chunks = std::make_unique<llama_moe_chunks>(model, backend_ptrs, std::min(n_chunks, 64), chunks_env != nullptr);
+        }
+        size_t flex_req = 0;
+        if (cparams.moe_cache_size == SIZE_MAX) {
+            // auto: the compute buffers of the worst-case graphs first (without the cache: its graph differs only by views and
+            // the hybrid's small host tensors), then what is left of the devices' memory, minus the margin
+            // with several GPUs each keeps the margin without the draft's part, and the last one (where a layer-split draft model
+            // loads: its layer and output) also the draft's part; the cache is then split by what each GPU has left
+            sched_reserve();
+            // slot lending (one GPU with VMM, ubatch above 512, LLAMA_MOE_FLEX=0: off): the compute buffers of 512-token ubatches
+            // are reserved, and the difference to the full ubatch's is cache slots that prompt batches borrow (pcbox 5070 Ti
+            // 16 GB: -ub 4096 took 1.3 GB of Qwen3.8's cache, 2.1 GB of DS4.1's, decode -7% / -9%)
+            {
+                size_t n_gpu = 0, big = 0;
+                ggml_backend_buffer_type_t gpu_buft = nullptr;
+                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                    ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+                    if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        n_gpu++;
+                        big += backend_buf_exp_size[i];
+                        gpu_buft = backend_buft[i];
+                    }
+                }
+                const uint32_t small_ub = 512;
+                if (n_gpu == 1 && cparams.n_ubatch > small_ub && llama_moe_cache::flex_ok(gpu_buft) && !model.no_alloc()) {
+                    reserve_ub = small_ub;
+                    sched_need_reserve = true;
+                    sched_reserve();
+                    size_t small = 0;
+                    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                        ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+                        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                            small += backend_buf_exp_size[i];
+                        }
+                    }
+                    // 64 MiB over the difference: the large graphs' allocator does not always pack as tightly as at reserve time
+                    flex_req = big > small + ((size_t) 256 << 20) ? big - small + ((size_t) 64 << 20) : 0;
+                    if (flex_req == 0) {
+                        reserve_ub = 0;
+                        sched_need_reserve = true;
+                        sched_reserve();
+                    } else {
+                        flex_ub = small_ub;
+                        LLAMA_LOG_INFO("%s: MoE cache slot lending: compute buffers %zu MiB at ubatch %u, %zu MiB at %u: %zu MiB of the cache lent to prompt batches\n",
+                            __func__, big >> 20, cparams.n_ubatch, small >> 20, small_ub, flex_req >> 20);
+                    }
+                }
+            }
+            // LLAMA_GRAPH_POOL: each pooled scheduler has its own compute buffers for small batches (up to 8 tokens), and with a
+            // long context these grow with the KV cache (~110 MiB each at 45k tokens on a 12 GB card ran it out of memory,
+            // issue #2): measured here for the full context on a scratch scheduler and kept free per device on top of the margin.
+            // The pool gains ~1%, so it gets at most LLAMA_GRAPH_POOL_MIB (default 256) per device: fewer entries, or none, at long
+            // contexts (DeepSeek-V4.1 at 48k: 395 MiB per entry)
+            std::map<ggml_backend_dev_t, size_t> pool_bytes;
+            {
+                const char * pe = getenv("LLAMA_GRAPH_POOL");
+                const int    k  = pe ? atoi(pe) : 0;
+                const char * pm = getenv("LLAMA_GRAPH_POOL_MIB"); // < 0: not counted (the 2026-11-11 release behaviour)
+                if (k > 0 && !(pm && atoi(pm) < 0) && memory && !cparams.training && !model.no_alloc()) {
+                    auto mctx = memory->init_full();
+                    // as the tg reserve: one ubatch over every sequence (a KV stream each), here of up to 8 tokens per sequence; the
+                    // buffers hardly depend on the token count (Qwen3.8 at 48k: 745 / 750 / 757 MiB for 1 / 4 / 8 tokens)
+                    const uint32_t ns = cparams.n_seq_max;
+                    const uint32_t nt = std::max(ns, std::min<uint32_t>(8, std::min(cparams.n_ctx, cparams.n_ubatch))/ns*ns);
+                    std::vector<size_t> sizes(backend_ptrs.size(), 0);
+                    ggml_backend_sched_ptr tmp(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                        gf_res_reserve->get_max_nodes(), cparams.pipeline_parallel, cparams.op_offload));
+                    const uint32_t save_inputs = n_input_tensors;
+                    std::swap(sched, tmp);
+                    const bool ok = mctx && graph_reserve(nt, ns, nt, mctx.get(), true, sizes.data()) != nullptr;
+                    std::swap(sched, tmp);
+                    n_input_tensors = save_inputs;
+                    std::map<ggml_backend_dev_t, size_t> one; // per entry
+                    for (size_t i = 0; ok && i < backend_ptrs.size(); ++i) {
+                        ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+                        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                            one[dev] += sizes[i];
+                        }
+                    }
+                    const size_t budget = (size_t) (pm ? std::max(0, atoi(pm)) : 256)*1024*1024;
+                    int    k_fit = ok ? k : 0;
+                    size_t per   = 0;
+                    for (const auto & [dev, sz] : one) {
+                        per = std::max(per, sz);
+                        if (sz > 0) {
+                            k_fit = std::min<int>(k_fit, (int) (budget/sz));
+                        }
+                    }
+                    for (const auto & [dev, sz] : one) {
+                        pool_bytes[dev] = (size_t) k_fit*sz;
+                    }
+                    graph_pool_k = k_fit;
+                    graph_pool.clear();
+                    graph_pool_reset();
+                    LLAMA_LOG_INFO("%s: MoE cache auto size: %d of %d pooled graphs (LLAMA_GRAPH_POOL, %.0f MiB each at the full context, "
+                        "LLAMA_GRAPH_POOL_MIB %zu) keep %zu MiB for their compute buffers\n",
+                        __func__, k_fit, k, per/1024.0/1024.0, budget/(1024*1024), (size_t) k_fit*per/(1024*1024));
+                }
+            }
+            std::vector<ggml_backend_dev_t> gpus;
+            for (const auto & d : model.devices) {
+                if (!d.is_meta && ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    gpus.push_back(d.dev);
+                }
+            }
+            const size_t margin = cparams.moe_cache_margin;
+            size_t free_sum = 0;
+            size_t avail_sum = 0;
+            for (size_t i = 0; i < gpus.size(); ++i) {
+                size_t free = 0, total = 0;
+                ggml_backend_dev_memory(gpus[i], &free, &total);
+                const size_t reserve = (i + 1 == gpus.size() ? margin : margin - cparams.moe_cache_margin_draft) +
+                    (pool_bytes.count(gpus[i]) ? pool_bytes[gpus[i]] : 0);
+                free_sum  += free;
+                avail_sum += free > reserve ? free - reserve : 0;
+                moe_cache_dev_budget[gpus[i]] = free > reserve ? free - reserve : 0;
+            }
+            if (gpus.size() < 2) {
+                moe_cache_dev_budget.clear();
+            }
+            cparams.moe_cache_size = avail_sum/(1024*1024)*(1024*1024);
+            LLAMA_LOG_INFO("%s: MoE cache auto size: %zu MiB (%zu MiB free after the compute buffers, %zu MiB margin)\n", __func__,
+                cparams.moe_cache_size/(1024*1024), free_sum/(1024*1024), margin/(1024*1024));
+            if (cparams.moe_cache_size < (size_t) 256*1024*1024) {
+                LLAMA_LOG_WARN("%s: MoE cache auto size: less than 256 MiB free, the cache is disabled\n", __func__);
+                cparams.moe_cache_size = 0;
+            }
+        }
         if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size);
+            moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size,
+                moe_cache_dev_budget, flex_req);
+            if (!cparams.op_offload) {
+                moe_cache->disable_prefill_share();
+            }
         }
 
         sched_reserve();
@@ -586,6 +729,11 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (!graph_pool.empty()) {
+        LLAMA_LOG_INFO("%s: graph pool (%zu): %zu swaps reused a pooled graph, %zu rebuilt in a pooled scheduler\n", __func__,
+            graph_pool.size(), n_pool_hits, n_pool_misses);
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.no_alloc() && !opt_ctx) {
@@ -727,6 +875,25 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+    sched_main = sched.get();
+}
+
+void llama_context::moe_flex_step(uint32_t n_tokens) {
+    if (!moe_cache || flex_ub == 0) {
+        return;
+    }
+    if (n_tokens > flex_ub && reserve_ub > 0) {
+        // a prompt batch: the lent slots' VRAM goes to the full ubatch's compute buffers (reserved by the next sched_reserve)
+        synchronize();
+        moe_cache->flex_release();
+        reserve_ub = 0;
+        sched_need_reserve = true;
+    } else if (n_tokens <= flex_ub && reserve_ub == 0) {
+        // back to small batches: reserve the small compute buffers (frees the large ones), then the lent slots are mapped again
+        synchronize();
+        reserve_ub = flex_ub;
+        sched_need_reserve = true;
+    }
 }
 
 void llama_context::sched_reserve() {
@@ -743,7 +910,7 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_tokens = std::min(cparams.n_ctx, reserve_ub > 0 ? std::min(reserve_ub, cparams.n_ubatch) : cparams.n_ubatch);
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
@@ -754,6 +921,7 @@ void llama_context::sched_reserve() {
     }
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
+    graph_pool_reset();
 
     sched_new(max_nodes, cparams.pipeline_parallel);
 
@@ -885,12 +1053,56 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
+bool llama_context::mtp_chain_enabled() const {
+    return model.mtp_chain_tok != nullptr;
+}
+
+void llama_context::mtp_chain_begin(llama_token token, const float * h) {
+    GGML_ASSERT(model.mtp_chain_tok);
+    synchronize();
+    ggml_backend_tensor_set(model.mtp_chain_tok, &token, 0, sizeof(token));
+    ggml_backend_tensor_set(model.mtp_chain_h, h, 0, ggml_nbytes(model.mtp_chain_h));
+    model.mtp_chain_active = true;
+}
+
+void llama_context::mtp_chain_record(int32_t step) {
+    GGML_ASSERT(model.mtp_chain_tok && step >= 0 && step < (int32_t) model.mtp_chain_out_rows.size());
+    // on the stream of the device that holds the buffers, after the step's graph and before the next one
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(model.mtp_chain_tok->buffer);
+    for (auto & b : backends) {
+        if (ggml_backend_supports_buft(b.get(), buft) && !ggml_backend_buft_is_host(buft)) {
+            ggml_backend_tensor_copy_async(b.get(), b.get(), model.mtp_chain_tok, model.mtp_chain_out_rows[step]);
+            return;
+        }
+    }
+    GGML_ABORT("no backend for the MTP chain buffers");
+}
+
+void llama_context::mtp_chain_end(llama_token * out, int32_t n) {
+    synchronize();
+    for (auto & b : backends) {
+        ggml_backend_synchronize(b.get());
+    }
+    if (n > 0) {
+        ggml_backend_tensor_get(model.mtp_chain_out, out, 0, n*sizeof(llama_token));
+    }
+    model.mtp_chain_active = false;
+}
+
 void llama_context::synchronize() {
+    LC_PROF("ctx.synchronize");
     if (!sched) {
         return;
     }
 
-    ggml_backend_sched_synchronize(sched.get());
+    {
+        const auto lc_t0 = std::chrono::steady_clock::now();
+        ggml_backend_sched_synchronize(sched.get());
+        // only the verify pass waits this long: start the verify end -> first draft laps here
+        if (llama_prof_on() && std::chrono::steady_clock::now() - lc_t0 > std::chrono::milliseconds(2)) {
+            llama_prof_lap_begin();
+        }
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -996,6 +1208,7 @@ bool llama_context::memory_update(bool optimize) {
             }
         }
         gf_res_prev_active = nullptr;
+        graph_pool_reset();
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1523,10 +1736,37 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    {
+    LC_PROF("pu.mctx_apply");
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+    }
+
+    // MoE cache GPU fetch: the previous decode graph's experts are read and this ubatch's slot maps uploaded, before a graph
+    // is rebuilt (which may reuse the outputs' memory)
+    if (moe_cache) {
+        moe_cache->fetch_begin(ubatch.n_tokens);
+    }
+
+    // the MoE cache's hybrid gate may have switched its CPU path on or off: the graph changes
+    const bool moe_graph_change = moe_cache && moe_cache->take_graph_change();
+
+    // LLAMA_GRAPH_POOL: a pooled graph of this shape (or a free scheduler) is swapped in first. With a MoE cache, a pooled
+    // graph is not reused after the gate switched, and its hybrid registrations (the tensors the per-layer callbacks read)
+    // are replayed
+    if (moe_graph_change) {
+        graph_pool_reset();
+    }
+    if (!graph_pool.empty() && ubatch.n_tokens > 8) {
+        graph_pool_main();
+    }
+    if (!graph_pool.empty() && ubatch.n_tokens <= 8 && !graph_reuse_disable && !moe_graph_change) {
+        if (graph_pool_swap(ubatch, mctx, gtype) && moe_cache) {
+            moe_replay_regs(get_gf_res_prev());
+        }
     }
 
     auto * res = get_gf_res_prev();
@@ -1535,8 +1775,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    llama_prof_lap("lap.d_ubatch_to_reuse");
+    llama_prof_scope lc_prof_reuse("pu.reuse_check_or_build");
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    if (!graph_reuse_disable && !moe_graph_change && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1544,6 +1786,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // that the previous compute is still reading.
         if (cparams.pipeline_parallel) {
             ggml_backend_sched_synchronize(sched.get());
+        }
+
+        // the MoE cache's prefill share registrations may have been replaced by another large-batch graph
+        if (moe_cache && ubatch.n_tokens > 8) {
+            moe_replay_regs(res);
         }
 
         n_reused++;
@@ -1556,6 +1803,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+        LC_PROF(ggml_graph_n_nodes(res->get_gf()) > 2000 || gparams.ubatch.n_tokens > 64 ? "pu.rebuild.tgt_or_big" : "pu.rebuild.small");
         gf = model.build_graph(gparams);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
@@ -1566,6 +1814,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        llama_prof_scope lc_prof_alloc(gparams.ubatch.n_tokens > 64 || ggml_graph_n_nodes(gf) > 2000 ? "pu.sched_alloc.tgt_or_big" : "pu.sched_alloc.small");
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
@@ -1575,17 +1824,34 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = res;
     }
 
+    // MoE cache GPU fetch: the outputs the next ubatch reads are this graph's (a reserve may have registered its own since)
+    if (moe_cache) {
+        for (const auto & r : res->moe_hyb_regs) {
+            if (r.fids != nullptr) {
+                moe_cache->fetch_register_ids(r.il, r.fids);
+            }
+        }
+    }
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        llama_prof_lap("lap.d_reuse");
+        lc_prof_reuse.~llama_prof_scope(); new (&lc_prof_reuse) llama_prof_scope("pu.set_inputs");
+        ggml_backend_sched_wait_input_copies(sched.get()); // GGML_SCHED_BATCH_INPUTS=2
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    llama_prof_lap("lap.d_set_inputs");
+    lc_prof_reuse.~llama_prof_scope(); new (&lc_prof_reuse) llama_prof_scope(ggml_graph_n_nodes(res->get_gf()) > 2000 ? "pu.graph_compute.tgt" : "pu.graph_compute.dft");
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (moe_cache) {
+        moe_cache->fetch_end(); // GPU fetch: read the graph's selected experts behind it
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1841,6 +2107,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    LC_PROF("ctx.decode");
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -1934,7 +2201,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     output_swaps.clear();
     embd_batch_idxs.clear();
 
+    moe_flex_step((uint32_t) n_tokens_all);
+
     sched_reserve();
+    if (moe_cache && flex_ub > 0 && reserve_ub > 0 && !moe_cache->flex_in()) {
+        // the small compute buffers are back (their reserve freed the large ones): the lent slots too
+        moe_cache->flex_restore();
+    }
 
     bool did_optimize = false;
 
@@ -1944,6 +2217,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     llama_memory_context_ptr mctx;
 
     while (true) {
+        LC_PROF("ctx.decode.init_batch");
         mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
         if (!mctx) {
             return -2;
@@ -2021,7 +2295,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        const llm_graph_result * res;
+        {
+            llama_prof_lap("lap.d_decode_to_ubatch");
+            LC_PROF("ctx.decode.process_ubatch");
+            res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2572,6 +2851,100 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     return res;
 }
 
+void llama_context::graph_pool_reset() {
+    if (graph_pool.empty()) {
+        static const int k_env = getenv("LLAMA_GRAPH_POOL") ? atoi(getenv("LLAMA_GRAPH_POOL")) : 0;
+        const int k = graph_pool_k >= 0 ? graph_pool_k : k_env;
+        if (k <= 0) {
+            return;
+        }
+        graph_pool.resize(k);
+    }
+    graph_pool_main(); // a reserve after the reset must use the main scheduler
+    for (auto & e : graph_pool) {
+        if (e.res) {
+            e.res->reset();
+        }
+        if (e.sched) {
+            ggml_backend_sched_reset(e.sched.get());
+        }
+        e.active = false;
+    }
+}
+
+void llama_context::graph_pool_main() {
+    if (sched.get() == sched_main) {
+        return;
+    }
+    for (auto & e : graph_pool) {
+        if (e.sched.get() != sched_main) {
+            continue;
+        }
+        // as graph_pool_swap: the current pair goes to the pool, the main one comes back with its graph if still allocated
+        auto & cur = gf_res_prev[n_outputs > 0];
+        const bool cur_active = cur && gf_res_prev_active == cur.get();
+        if (!cur) {
+            cur.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+        }
+        const bool main_active = e.active;
+        std::swap(sched, e.sched);
+        std::swap(cur, e.res);
+        if (!cur) {
+            cur.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+        }
+        e.active = cur_active;
+        e.used   = ++graph_pool_clock;
+        gf_res_prev_active = main_active ? cur.get() : nullptr;
+        return;
+    }
+}
+
+bool llama_context::graph_pool_swap(const llama_ubatch & ubatch, const llama_memory_context_i * mctx, llm_graph_type gtype) {
+    auto & cur = gf_res_prev[n_outputs > 0];
+    if (cur && gf_res_prev_active == cur.get() && cur->can_reuse(graph_params(cur.get(), ubatch, mctx, gtype))) {
+        return true;
+    }
+    graph_pool_entry * slot = nullptr;
+    for (auto & e : graph_pool) {
+        if (e.active && e.res->can_reuse(graph_params(e.res.get(), ubatch, mctx, gtype))) {
+            slot = &e;
+            break;
+        }
+    }
+    const bool hit = slot != nullptr;
+    if (!hit) {
+        // least recently used, free ones first
+        for (auto & e : graph_pool) {
+            if (!slot || (!e.active && slot->active) || (e.active == slot->active && e.used < slot->used)) {
+                slot = &e;
+            }
+        }
+        if (!slot->sched) {
+            slot->sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                gf_res_reserve->get_max_nodes(), cparams.pipeline_parallel, cparams.op_offload));
+            ggml_backend_sched_set_copy_callback(slot->sched.get(), sched_copy_experts, this);
+            ggml_backend_sched_set_realloc_callback(slot->sched.get(), sched_graph_realloc, this);
+        }
+        if (!slot->res) {
+            slot->res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+        }
+        slot->res->reset();
+        slot->active = false;
+    }
+    // the current pair goes to the pool, with its graph if that graph is the one allocated in its scheduler
+    const bool cur_active = cur && gf_res_prev_active == cur.get();
+    if (!cur) {
+        cur.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+    }
+    std::swap(sched, slot->sched);
+    std::swap(cur, slot->res);
+    slot->active = cur_active;
+    slot->used   = ++graph_pool_clock;
+    gf_res_prev_active = hit ? cur.get() : nullptr;
+    (hit ? n_pool_hits : n_pool_misses)++;
+    return hit;
+}
+
 llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
@@ -2660,6 +3033,7 @@ ggml_cgraph * llama_context::graph_reserve(
         }
     }
     gf_res_prev_active = nullptr;
+    graph_pool_reset();
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -2723,6 +3097,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
+        /*.moe_chunks  =*/ moe_chunks.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.samplers    =*/ sampling.samplers,
@@ -2782,6 +3157,21 @@ ggml_status llama_context::graph_compute(
     return status;
 }
 
+void llama_context::moe_replay_regs(llm_graph_result * res) {
+    for (const auto & r : res->moe_hyb_regs) {
+        if (r.fids != nullptr) {
+            moe_cache->fetch_register_ids(r.il, r.fids);
+            continue;
+        }
+        if (r.ids != nullptr) {
+            moe_cache->set_prefill_layer(r.il, r.x, r.w, r.ids, (llama_moe_cache::act_type) r.act, r.limit);
+        } else {
+            moe_cache->set_hybrid_layer(r.il, r.x, r.w, (llama_moe_cache::act_type) r.act, r.limit);
+            moe_cache->set_lookahead_layer(r.il, r.la);
+        }
+    }
+}
+
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
@@ -2789,6 +3179,9 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
         return true;
     }
+
+    // the scheduler does not wait for the backend before calling the callback (see ggml_backend_sched_copy_input)
+    ggml_backend_synchronize(backend);
 
     auto & st = lctx->copy_experts;
 
@@ -2801,12 +3194,25 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         return false;
     }
 
-    const ggml_tensor * ids = node->src[2];
+    // an expert range of the host experts (llama_moe_chunks): the first one reads the layer's ids, the others a copy
+    int64_t e0 = 0;
+    const ggml_tensor * w = lctx->moe_chunks ? lctx->moe_chunks->chunk_of(src, &e0) : nullptr;
+    ggml_tensor * ids_chunk = nullptr;
+    if (w != nullptr) {
+        if (e0 > 0) {
+            ids_chunk = node->src[2];
+            GGML_ASSERT(ids_chunk->op == GGML_OP_CONT && ggml_is_contiguous(ids_chunk));
+        }
+    } else {
+        w = src;
+    }
+    const ggml_tensor * ids = ids_chunk ? ids_chunk->src[0] : node->src[2];
     if (ggml_nelements(ids) == 0) {
         return true;
     }
 
-    const int64_t n_expert    = src->ne[2];
+    const int64_t n_expert    = w->ne[2];
+    const int64_t e1          = e0 + src->ne[2];
     const size_t  expert_size = src->nb[2];
 
     if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
@@ -2823,44 +3229,159 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             }
         }
 
+        // the MoE cache's prefill share: the CPU computes some of these experts, they are not uploaded
+        if (lctx->moe_cache) {
+            // store mode: the used experts not in VRAM read into the arena first (the copies and the CPU job read them there)
+            lctx->moe_cache->prefill_arena(w, st.used);
+            lctx->moe_cache->prefill_plan(backend, w, ids, st.ids_data, st.used);
+        }
+
         st.ids = ids;
     }
 
+    // the range's ids: the experts of the other ranges are out of range, the MUL_MAT_ID skips their pairs
+    if (ids_chunk != nullptr) {
+        const int32_t n_c = (int32_t) src->ne[2];
+        st.ids_chunk.resize(ggml_nelements(ids));
+        for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
+            for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
+                const int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
+                st.ids_chunk[i1*ids->ne[0] + i0] = id >= e0 && id < e1 ? id - (int32_t) e0 : n_c;
+            }
+        }
+        ggml_backend_tensor_set_async(backend, ids_chunk, st.ids_chunk.data(), 0, ggml_nbytes(ids_chunk));
+    }
+
+    // one gather kernel for the range's copies (LLAMA_MOE_GATHER=1, opt-in; default one copy per run): the cached experts
+    // from VRAM and the uploads from pinned host memory the GPU reads in place (the arena, LLAMA_MOE_PIN_EXPS); host memory it
+    // cannot read (a file mapping) and the pads keep their own copies
+    using gather_t  = bool (*)(ggml_backend_t, int, void * const *, const void * const *, const size_t *);
+    using hostdev_t = void * (*)(const void *);
+    static gather_t  gather_fn  = nullptr;
+    static hostdev_t hostdev_fn = nullptr;
+    static bool gather_init = false;
+    if (!gather_init) {
+        gather_init = true;
+        // opt-in: SM loads over PCIe were slower than the copy engines (pcbox1 5090, Maya-XS DS4.1 16k prompt: 18.6-19.2 s
+        // against 16.0-16.6 s with the per-run copies)
+        if (getenv("LLAMA_MOE_GATHER") && atoi(getenv("LLAMA_MOE_GATHER")) != 0) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            gather_fn  = reg ? (gather_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_gather_copy") : nullptr;
+            hostdev_fn = reg ? (hostdev_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_ptr_device") : nullptr;
+            if (!gather_fn || !hostdev_fn) {
+                gather_fn = nullptr;
+            }
+        }
+    }
+    const bool gather = gather_fn != nullptr && ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_GPU;
+    st.g_dst.clear();
+    st.g_src.clear();
+    st.g_size.clear();
+    // the device address of host memory p (inside host tensor w if w != nullptr), nullptr: the GPU cannot read it in place
+    auto host_dev = [&](const void * p, const ggml_tensor * hw) -> const void * {
+        intptr_t delta = INTPTR_MIN;
+        if (hw != nullptr) {
+            auto it = st.host_dev.find(hw->data);
+            if (it == st.host_dev.end()) {
+                void * d = hostdev_fn(hw->data);
+                it = st.host_dev.emplace(hw->data, d ? (intptr_t) d - (intptr_t) hw->data : INTPTR_MIN).first;
+            }
+            delta = it->second;
+        } else {
+            const uintptr_t k = (uintptr_t) p >> 30;
+            auto it = st.host_dev_gb.find(k);
+            if (it == st.host_dev_gb.end()) {
+                void * d = hostdev_fn(p);
+                it = st.host_dev_gb.emplace(k, d ? (intptr_t) d - (intptr_t) p : INTPTR_MIN).first;
+            }
+            delta = it->second;
+        }
+        return delta == INTPTR_MIN ? nullptr : (const void *) ((intptr_t) p + delta);
+    };
+    // dst bytes [off, off + n) from host memory p (of host tensor hw, or the arena if nullptr)
+    auto put_host = [&](size_t off, const void * p, size_t n, const ggml_tensor * hw) {
+        const void * d = gather ? host_dev(p, hw) : nullptr;
+        if (d != nullptr) {
+            st.g_dst.push_back((char *) dst->data + off);
+            st.g_src.push_back(d);
+            st.g_size.push_back(n);
+        } else {
+            ggml_backend_tensor_set_async(backend, dst, p, off, n);
+        }
+    };
+
     // group consecutive experts and copy them together
-    for (int64_t first = 0; first < n_expert; ) {
+    for (int64_t first = e0; first < e1; ) {
         if (!st.used[first]) {
             first++;
             continue;
         }
         int64_t last = first;
-        while (last + 1 < n_expert && st.used[last + 1]) {
+        while (last + 1 < e1 && st.used[last + 1]) {
             last++;
         }
+
+        // experts [a, b) uploaded from host memory: the ones in the MoE cache's arena (store mode) from there, one by one, the
+        // others from the mapping in runs; pad bytes extra after the last one (the arena reads 512 past each expert)
+        auto upload = [&](int64_t a, int64_t b, size_t pad) {
+            int64_t run = a;
+            for (int64_t e = a; e < b && lctx->moe_cache; ++e) {
+                const uint8_t * p = lctx->moe_cache->arena_expert(w, e);
+                if (p == nullptr) {
+                    continue;
+                }
+                if (run < e) {
+                    put_host((run - e0)*expert_size, (const uint8_t *) src->data + (run - e0)*expert_size, (e - run)*expert_size, src);
+                }
+                put_host((e - e0)*expert_size, p, expert_size + (e + 1 == b ? pad : 0), nullptr);
+                run = e + 1;
+            }
+            // the pad alone when the last expert came from the arena with its pad, or from the device (as before)
+            const size_t size = (b - run)*expert_size + (run < b || b == a || lctx->moe_cache->arena_expert(w, b - 1) == nullptr ? pad : 0);
+            if (size > 0 && run == b) {
+                // only the pad (the bytes after an expert copied from VRAM or the arena): zeros, not the mapping, which store
+                // mode drops: each such pad was a page fault read from the SSD (pcbox1 32 GB + 5090: ~10 s per prompt)
+                static const uint8_t zeros[4096] = {};
+                GGML_ASSERT(size <= sizeof(zeros));
+                ggml_backend_tensor_set_async(backend, dst, zeros, (run - e0)*expert_size, size);
+            } else if (size > 0) {
+                put_host((run - e0)*expert_size, (const uint8_t *) src->data + (run - e0)*expert_size, size, src);
+            }
+        };
 
         // the experts in the MoE cache are copied from device memory, the others are uploaded
         int64_t next = first;
         for (int64_t e = first; e <= last && lctx->moe_cache; ) {
-            const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, last);
+            const void * cs = nullptr;
+            const int64_t n = lctx->moe_cache->copy_experts(backend, w, dst, e, last, e0, gather ? &cs : nullptr);
             if (n == 0) {
                 e++;
                 continue;
             }
             if (next < e) {
-                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+                upload(next, e, 0);
+            }
+            if (cs != nullptr) {
+                st.g_dst.push_back((char *) dst->data + (e - e0)*expert_size);
+                st.g_src.push_back(cs);
+                st.g_size.push_back((size_t) n*expert_size);
             }
             e   += n;
             next = e;
         }
 
         // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
-        const size_t offset  = next*expert_size;
-        const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
-        const size_t size    = (last + 1 - next)*expert_size + padding;
-        if (size > 0) {
-            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+        const size_t padding = last < e1 - 1 ? std::min<size_t>(expert_size, 512) : 0;
+        if (last + 1 - next > 0 || padding > 0) {
+            upload(next, last + 1, padding);
         }
 
         first = last + 1;
+    }
+    for (size_t i = 0; i < st.g_dst.size(); i += 8192) {
+        const int n = (int) std::min<size_t>(8192, st.g_dst.size() - i);
+        GGML_ASSERT(gather_fn(backend, n, st.g_dst.data() + i, st.g_src.data() + i, st.g_size.data() + i));
     }
 
     return true;
@@ -3920,7 +4441,8 @@ void llama_context::opt_epoch_iter(
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
             ggml_opt_alloc(opt_ctx, train);
 
-            res->set_inputs(&ubatch);
+            ggml_backend_sched_wait_input_copies(sched.get()); // GGML_SCHED_BATCH_INPUTS=2
+        res->set_inputs(&ubatch);
             {
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
                 GGML_ASSERT(labels->ne[1] == n_ubatch);
@@ -4025,6 +4547,8 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.moe_cache_margin            =*/ (size_t) 1024*1024*1024,
+        /*.moe_cache_margin_draft      =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -4183,6 +4707,14 @@ uint32_t llama_n_rs_seq(const llama_context * ctx) {
     return ctx->get_cparams().n_rs_seq;
 }
 
+bool llama_context::moe_shadow(bool on) {
+    return moe_cache ? moe_cache->set_shadow(on) : false;
+}
+
+bool llama_moe_shadow(llama_context * ctx, bool on) {
+    return ctx->moe_shadow(on);
+}
+
 const llama_model * llama_get_model(const llama_context * ctx) {
     return &ctx->get_model();
 }
@@ -4316,6 +4848,22 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
     return ctx->set_sampler(seq_id, smpl);
+}
+
+bool llama_mtp_chain_enabled(const llama_context * ctx) {
+    return ctx->mtp_chain_enabled();
+}
+
+void llama_mtp_chain_begin(llama_context * ctx, llama_token token, const float * h) {
+    ctx->mtp_chain_begin(token, h);
+}
+
+void llama_mtp_chain_record(llama_context * ctx, int32_t step) {
+    ctx->mtp_chain_record(step);
+}
+
+void llama_mtp_chain_end(llama_context * ctx, llama_token * out, int32_t n) {
+    ctx->mtp_chain_end(out, n);
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {

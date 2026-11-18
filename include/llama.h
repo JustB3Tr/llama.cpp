@@ -396,7 +396,9 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
-        size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+        size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled, SIZE_MAX = auto [EXPERIMENTAL]
+        size_t moe_cache_margin; // auto size: device memory in bytes left free after the compute buffers
+        size_t moe_cache_margin_draft; // auto size: the part of the margin for a draft model loaded later, kept on the last GPU
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -581,6 +583,10 @@ extern "C" {
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
+
+    // tandem.cpp: turns the MoE cache's shadow mode on or off for the next decodes (see llama_moe_cache::set_shadow);
+    // returns whether it is on (only when the experts are read from the SSD)
+    LLAMA_API bool     llama_moe_shadow (struct llama_context * ctx, bool on);
 
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
@@ -1435,6 +1441,14 @@ extern "C" {
     // attach a sampler to the context
     // note: prefer initializing the context with llama_context_params.samplers when possible
     LLAMA_API bool llama_set_sampler(struct llama_context * ctx, llama_seq_id seq_id, struct llama_sampler * smpl);
+
+    // LLAMA_MTP_CHAIN (hydev): greedy MTP draft steps chained on the device. begin() sets the first token and h
+    // and stops the 1-token graph input from overwriting the chain buffers; after each chained 1-token decode,
+    // record(step) keeps its greedy token; end() waits and returns the n recorded tokens
+    LLAMA_API bool llama_mtp_chain_enabled(const struct llama_context * ctx);
+    LLAMA_API void llama_mtp_chain_begin (struct llama_context * ctx, llama_token token, const float * h);
+    LLAMA_API void llama_mtp_chain_record(struct llama_context * ctx, int32_t step);
+    LLAMA_API void llama_mtp_chain_end   (struct llama_context * ctx, llama_token * out, int32_t n);
 
     // mirror of llama_sampler_i:
     LLAMA_API struct llama_sampler * llama_sampler_init  (      struct llama_sampler_i * iface, llama_sampler_context_t ctx);

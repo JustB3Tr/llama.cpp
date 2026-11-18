@@ -116,7 +116,11 @@ static __global__ void dsv4_hc_pre_f32(
         int64_t sw2,
         int64_t sd0,
         int64_t sd1,
-        float   scale) {
+        float   scale,
+        const float * aff_scale,
+        const float * aff_base,
+        int64_t sb0,
+        float   aff_eps) {
     ggml_cuda_pdl_lc();
     const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t nr = n_embd * n_tokens;
@@ -138,6 +142,11 @@ static __global__ void dsv4_hc_pre_f32(
             wv = 1.0f / (1.0f + expf(-weights[i0*sw0 + ih*sw1 + it*sw2]));
         } else {
             wv = weights[ih*sw0 + it*sw1];
+            if (aff_scale) {
+                // the same operations as mul -> add -> sigmoid -> scale_bias(1, eps), without contraction into an fma
+                const float v = __fadd_rn(__fmul_rn(wv, aff_scale[0]), aff_base[ih*sb0]);
+                wv = __fadd_rn(1.0f / (1.0f + expf(-v)), aff_eps);
+            }
         }
         sum += xv * wv;
     }
@@ -170,7 +179,17 @@ static __global__ void dsv4_hc_post_f32(
         int64_t sd1,
         int64_t sd2,
         float gate_scale_in,
-        float gate_scale_out) {
+        float gate_scale_out,
+        int     post_sig,
+        float   post_in,
+        float   post_out,
+        const float * add,
+        const float * add_gate,
+        int64_t sa1,
+        int64_t sg1,
+        const float * aff_scale,
+        const float * aff_base,
+        int64_t sb0) {
     ggml_cuda_pdl_lc();
     const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t nr = n_embd * hc * n_tokens;
@@ -185,12 +204,25 @@ static __global__ void dsv4_hc_post_f32(
     const int64_t idst = (ir / n_embd) % hc;
     const int64_t it   = ir / (n_embd * hc);
 
-    float p = post[idst*sp0 + it*sp1];
+    float pv = post[idst*sp0 + it*sp1];
     if constexpr (gated) {
-        p = gate_scale_out * (1.0f / (1.0f + expf(-(gate_scale_in * p))));
+        pv = gate_scale_out * (1.0f / (1.0f + expf(-(gate_scale_in * pv))));
     }
-
-    float sum = x[i0*sx0 + it*sx1] * p;
+    if (post_sig == 2) {
+        // the same operations as mul -> add -> sigmoid -> scale, without contraction into an fma
+        const float v = __fadd_rn(__fmul_rn(pv, aff_scale[0]), aff_base[idst*sb0]);
+        pv = post_out * (1.0f / (1.0f + expf(-v)));
+    } else if (post_sig) {
+        // same operations as scale -> sigmoid -> scale
+        pv = post_out * (1.0f / (1.0f + expf(-(post_in * pv))));
+    }
+    float xv = x[i0*sx0 + it*sx1];
+    if (add) {
+        // same operations as sigmoid -> mul -> add, without contraction into an fma
+        const float g = 1.0f / (1.0f + expf(-add_gate[it*sg1]));
+        xv = __fadd_rn(xv, __fmul_rn(add[i0 + it*sa1], g));
+    }
+    float sum = xv * pv;
     if constexpr (has_comb) {
         for (int64_t isrc = 0; isrc < hc; ++isrc) {
             sum += residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
@@ -270,6 +302,9 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
+    const bool affine = ggml_get_op_params_i32(dst, 2) != 0;
+    GGML_ASSERT(!affine || (!gated && dst->src[2] && dst->src[3]));
+
     auto kernel = gated ? dsv4_hc_pre_f32<true> : dsv4_hc_pre_f32<false>;
     ggml_cuda_kernel_launch(kernel, launch_params,
             (const float *) x->data, (const float *) weights->data, (float *) dst->data,
@@ -277,7 +312,11 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
             nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float),
-            scale);
+            scale,
+            affine ? (const float *) dst->src[2]->data : nullptr,
+            affine ? (const float *) dst->src[3]->data : nullptr,
+            affine ? dst->src[3]->nb[0] / sizeof(float) : 0,
+            affine ? ggml_get_op_params_f32(dst, 3) : 0.0f);
 }
 
 void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
@@ -298,6 +337,8 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     GGML_ASSERT(post->type == GGML_TYPE_F32);
     GGML_ASSERT(comb == nullptr || comb->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->src[4] == nullptr || dst->src[4]->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_get_op_params_i32(dst, 0) != 2 || (dst->src[6] && dst->src[7]));
 
     GGML_TENSOR_LOCALS(size_t, nbx, x,        nb);
     GGML_TENSOR_LOCALS(size_t, nbr, residual, nb);
@@ -329,5 +370,13 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbp0 / sizeof(float), nbp1 / sizeof(float),
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
-            gate_in, gate_out);
+            gate_in, gate_out,
+            ggml_get_op_params_i32(dst, 0), ggml_get_op_params_f32(dst, 1), ggml_get_op_params_f32(dst, 2),
+            dst->src[4] ? (const float *) dst->src[4]->data : nullptr,
+            dst->src[5] ? (const float *) dst->src[5]->data : nullptr,
+            dst->src[4] ? dst->src[4]->nb[1] / sizeof(float) : 0,
+            dst->src[5] ? dst->src[5]->nb[1] / sizeof(float) : 0,
+            dst->src[6] ? (const float *) dst->src[6]->data : nullptr,
+            dst->src[7] ? (const float *) dst->src[7]->data : nullptr,
+            dst->src[7] ? dst->src[7]->nb[0] / sizeof(float) : 0);
 }

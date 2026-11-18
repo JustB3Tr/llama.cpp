@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -36,6 +37,32 @@ llama_memory_recurrent::llama_memory_recurrent(
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
 
+    // LLAMA_GDN_REPLAY (see the header): gated delta net states only ([S_v, S_v, H_v] with S_v = d_inner / dt_rank), one sequence
+    {
+        const char * e = getenv("LLAMA_GDN_REPLAY");
+        const uint32_t H_v = hparams.ssm_dt_rank;
+        const uint32_t S_v = H_v > 0 ? hparams.ssm_d_inner / H_v : 0;
+        // Qwen3.8 only (its graph has the direct state read the replay needs, LLAMA_GDN_DIRECT), every recurrent layer on a GPU
+        const char * gd = getenv("LLAMA_GDN_DIRECT");
+        replay = e != nullptr && atoi(e) != 0 && gd != nullptr && atoi(gd) != 0 && model.arch == LLM_ARCH_QWEN4EXP &&
+            offload && n_rs_seq > 0 && n_seq_max == 1 && mem_size == 1 && S_v > 0 &&
+            hparams.ssm_d_state > 0 && hparams.ssm_n_group > 0 && hparams.n_embd_s() == S_v*S_v*H_v;
+        for (int i = 0; replay && i < n_layer; i++) {
+            if (filter && !filter(i)) {
+                continue;
+            }
+            ggml_backend_dev_t dev = model.dev_layer(i);
+            replay = dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU;
+        }
+        if (replay) {
+            n_x_tok = hparams.ssm_d_state*hparams.ssm_n_group + hparams.ssm_d_inner + 2*H_v;
+        }
+        row_pend.assign(mem_size, 0);
+        row_xplane.assign(mem_size, 0);
+        cell_pend_in.assign(mem_size, 0);
+        cell_xplane_in.assign(mem_size, 0);
+    }
+
     cells.clear();
     cells.resize(mem_size);
 
@@ -53,7 +80,8 @@ llama_memory_recurrent::llama_memory_recurrent(
         if (it == ctx_map.end()) {
             ggml_init_params params = {
                 // r and s per layer, plus the separate PLE conv row where the model has one
-                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead() +
+                                         (replay ? n_layer*ggml_tensor_overhead() : 0)),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -74,6 +102,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     r_l.resize(n_layer);
     s_l.resize(n_layer);
     p_l.resize(n_layer);
+    x_l.resize(n_layer);
 
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
@@ -101,11 +130,17 @@ llama_memory_recurrent::llama_memory_recurrent(
 
         const uint32_t n_rows = mem_size * (1 + n_rs_seq);
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), replay ? mem_size : n_rows);
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
         s_l[i] = s;
+        if (replay) {
+            // F32: the replay reads back exactly what the op read
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) n_x_tok*(1 + n_rs_seq), 2*mem_size);
+            ggml_format_name(x, "cache_x_l%d", i);
+            x_l[i] = x;
+        }
 
         // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
         if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
@@ -127,6 +162,15 @@ llama_memory_recurrent::llama_memory_recurrent(
             n_rs_seq = 0;
             LLAMA_LOG_INFO("%s: disabling rollback snapshots because the memory module is empty\n", __func__);
         }
+        replay = false;
+    }
+    if (replay) {
+        size_t xb = 0;
+        for (const auto * x : x_l) {
+            xb += x ? ggml_nbytes(x) : 0;
+        }
+        LLAMA_LOG_INFO("%s: LLAMA_GDN_REPLAY: one S plane + %u tokens of inputs per layer (%.2f MiB) instead of %u snapshot planes\n",
+            __func__, n_rs_seq + 1, xb/1024.0/1024.0, n_rs_seq + 1);
     }
 
     {
@@ -160,6 +204,8 @@ void llama_memory_recurrent::clear(bool data) {
     }
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
+    std::fill(row_pend.begin(), row_pend.end(), 0);
+    std::fill(row_xplane.begin(), row_xplane.end(), 0);
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -208,7 +254,9 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
-                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                // with replay the kept inputs bound it: the last ubatch's tokens (none after a longer prompt batch)
+                const llama_pos bound = replay ? std::min<llama_pos>(n_rs_seq, row_pend[tail_id]) : (llama_pos) n_rs_seq;
+                if (!pending && rollback >= 1 && rollback <= bound) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
                     return true;
@@ -493,6 +541,11 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     auto org_cells = cells;
     auto org_used = used;
     auto org_head = head;
+    // the replay bookkeeping find_slot advances, too
+    auto org_pend = row_pend;
+    auto org_xplane = row_xplane;
+    auto org_pend_in = cell_pend_in;
+    auto org_xplane_in = cell_xplane_in;
 
     bool success = true;
 
@@ -507,6 +560,10 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     cells = std::move(org_cells);
     used = org_used;
     head = org_head;
+    row_pend = std::move(org_pend);
+    row_xplane = std::move(org_xplane);
+    cell_pend_in = std::move(org_pend_in);
+    cell_xplane_in = std::move(org_xplane_in);
 
     return success;
 }
@@ -700,6 +757,15 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         }
 
         for (int i = min; i <= max; ++i) {
+            if (replay) {
+                // the graph reads the source row's state and kept inputs and writes row i: a new sequence starts from the
+                // zeroed state with nothing to replay; the last ubatch of at most n_rs_seq + 1 tokens keeps its inputs
+                const int32_t src = cells[i].src;
+                cell_pend_in[i]   = src >= 0 ? row_pend[src]   : 0;
+                cell_xplane_in[i] = src >= 0 ? row_xplane[src] : 0;
+                row_pend[i]   = n_seq_tokens <= n_rs_seq + 1 ? n_seq_tokens : 0;
+                row_xplane[i] = 1 - cell_xplane_in[i];
+            }
             if (cells[i].src < 0) {
                 GGML_ASSERT(rs_z >= 0);
                 cells[i].src0 = rs_z;
@@ -783,6 +849,8 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data; // logical source row ranges
+    std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_s;    // replay: S rows (one plane)
+    std::vector<uint32_t> x_rows, x_rep;                         // replay: kept inputs, tokens to replay
     uint32_t cell_count = 0;
 
     // Count the number of cells with the specified seq_id
@@ -815,11 +883,22 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
                 }
             }
 
-            const uint32_t cell_id = rs_idx_cur * size + (cell.src >= 0 ? cell.src : (int32_t) i);
+            const uint32_t row     = cell.src >= 0 ? cell.src : (int32_t) i;
+            const uint32_t cell_id = rs_idx_cur * size + row;
             if (cell_ranges_data.empty() || cell_ranges_data.back().second != cell_id) {
                 cell_ranges_data.emplace_back(cell_id, cell_id + 1);
             } else {
                 cell_ranges_data.back().second++;
+            }
+            if (replay) {
+                if (cell_ranges_s.empty() || cell_ranges_s.back().second != row) {
+                    cell_ranges_s.emplace_back(row, row + 1);
+                } else {
+                    cell_ranges_s.back().second++;
+                }
+                GGML_ASSERT(rs_idx_cur <= row_pend[row]);
+                x_rows.push_back(2*row + row_xplane[row]);
+                x_rep.push_back(row_pend[row] - rs_idx_cur);
             }
 
             if (cell_range_begin == size) {
@@ -856,7 +935,11 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
     io.write(&cell_count, sizeof(cell_count));
 
     state_write_meta(io, cell_ranges, seq_id);
-    state_write_data(io, cell_ranges_data);
+    if (replay) {
+        state_write_data(io, cell_ranges_data, &cell_ranges_s, &x_rows, &x_rep);
+    } else {
+        state_write_data(io, cell_ranges_data);
+    }
 }
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -909,7 +992,9 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
     }
 }
 
-void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
+void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+        const std::vector<std::pair<uint32_t, uint32_t>> * rows_s, const std::vector<uint32_t> * x_rows,
+        const std::vector<uint32_t> * x_rep) const {
     const uint32_t s_trans = 0;
     const uint32_t n_layer = hparams.n_layer();
 
@@ -964,11 +1049,24 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             io.write(&s_size_row, sizeof(s_size_row));
 
             // Write each logical cell row range. With pending recurrent rollback,
-            // the logical current state may live in a rollback snapshot plane.
-            for (const auto & range : cell_ranges) {
+            // the logical current state may live in a rollback snapshot plane (with replay: the one plane, see x below).
+            for (const auto & range : rows_s ? *rows_s : cell_ranges) {
                 const size_t range_size = range.second - range.first;
                 const size_t buf_size = range_size * s_size_row;
                 io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
+            }
+        }
+        // replay: per layer and cell the tokens to replay over that S plane and their kept inputs
+        if (x_rows) {
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                if (s_l[il] == nullptr || x_l[il] == nullptr) continue;
+                const uint64_t x_size_row = ggml_row_size(x_l[il]->type, x_l[il]->ne[0]);
+                io.write(&x_size_row, sizeof(x_size_row));
+                for (size_t c = 0; c < x_rows->size(); ++c) {
+                    const uint32_t n_rep = (*x_rep)[c];
+                    io.write(&n_rep, sizeof(n_rep));
+                    io.write_tensor(x_l[il], (size_t) (*x_rows)[c] * x_size_row, x_size_row);
+                }
             }
         }
     } else {
@@ -1196,6 +1294,30 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
                 io.read_tensor(s_l[il], head * s_size_row, cell_count * s_size_row);
             }
         }
+        if (replay) {
+            // the kept inputs go to plane 0 of each restored row (the order of state_write_data)
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                if (s_l[il] == nullptr || x_l[il] == nullptr) continue;
+                uint64_t x_size_row_ref;
+                io.read(&x_size_row_ref, sizeof(x_size_row_ref));
+                const uint64_t x_size_row = ggml_row_size(x_l[il]->type, x_l[il]->ne[0]);
+                if (x_size_row != x_size_row_ref) {
+                    LLAMA_LOG_ERROR("%s: mismatched replay row size (%zu != %zu, layer %d)\n", __func__, (size_t) x_size_row, (size_t) x_size_row_ref, il);
+                    return false;
+                }
+                for (uint32_t c = 0; c < cell_count; ++c) {
+                    uint32_t n_rep = 0;
+                    io.read(&n_rep, sizeof(n_rep));
+                    if (n_rep > n_rs_seq + 1) {
+                        LLAMA_LOG_ERROR("%s: replay of %u tokens > %u\n", __func__, n_rep, n_rs_seq + 1);
+                        return false;
+                    }
+                    io.read_tensor(x_l[il], (size_t) (2*(head + c)) * x_size_row, x_size_row);
+                    row_pend[head + c]   = n_rep;
+                    row_xplane[head + c] = 0;
+                }
+            }
+        }
     } else {
         // For each layer, read the values for each cell (transposed)
         for (uint32_t il = 0; il < n_layer; ++il) {
@@ -1376,4 +1498,34 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         }
     }
     return (int32_t)(idx * mem->size) + src0;
+}
+
+bool llama_memory_recurrent_context::get_replay() const {
+    return mem->replay;
+}
+
+uint32_t llama_memory_recurrent_context::get_replay_k() const {
+    return mem->n_rs_seq + 1;
+}
+
+ggml_tensor * llama_memory_recurrent_context::get_x_l(int32_t il) const {
+    return mem->x_l[il];
+}
+
+void llama_memory_recurrent_context::replay_info(int32_t * out) const {
+    const uint32_t cell_idx = mem->head;
+    const int32_t  src0     = mem->cells[cell_idx].src0;
+    uint32_t rollback = 0;
+    if (!mem->cells[cell_idx].seq_id.empty()) {
+        const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
+        if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
+            rollback = mem->rs_idx[seq];
+        }
+    }
+    const uint32_t pend = mem->cell_pend_in[cell_idx];
+    GGML_ASSERT(rollback <= pend);
+    out[0] = src0;                                                    // S row (the zeroed row for a new sequence)
+    out[1] = 2*src0 + (int32_t) mem->cell_xplane_in[cell_idx];        // x row to replay from
+    out[2] = 2*(int32_t) cell_idx + 1 - (int32_t) mem->cell_xplane_in[cell_idx]; // x row this ubatch writes
+    out[3] = (int32_t) (pend - rollback);                             // tokens to replay
 }

@@ -14,6 +14,7 @@
 
 #include <array>
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 struct llama_model;
@@ -59,6 +60,12 @@ struct llama_context {
     void sched_reserve();
 
     void synchronize();
+
+    // LLAMA_MTP_CHAIN, see llama_mtp_chain_*
+    bool mtp_chain_enabled() const;
+    void mtp_chain_begin(llama_token token, const float * h);
+    void mtp_chain_record(int32_t step);
+    void mtp_chain_end(llama_token * out, int32_t n);
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
@@ -250,6 +257,9 @@ private:
 public:
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
 
+    // llama_moe_shadow
+    bool moe_shadow(bool on);
+
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
 
@@ -278,6 +288,8 @@ private:
 
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
+    // the MoE cache registrations of a graph that is reused (set_hybrid_layer, set_prefill_layer)
+    void moe_replay_regs(llm_graph_result * res);
 
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
@@ -308,6 +320,8 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+    std::map<ggml_backend_dev_t, size_t> moe_cache_dev_budget; // auto size with several GPUs: each GPU's share of the cache
+    llama_moe_chunks_ptr moe_chunks; // LLAMA_MOE_CHUNKS
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
@@ -367,6 +381,11 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+    // MoE cache slot lending (llama_moe_cache::flex_release): the compute buffers are reserved for ubatches of at most reserve_ub
+    // tokens (0: n_ubatch) while the cache holds the lendable slots; a batch of more tokens borrows them
+    uint32_t reserve_ub = 0;
+    uint32_t flex_ub    = 0;   // the small reserve's ubatch, 0: no slot lending
+    void moe_flex_step(uint32_t n_tokens);
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved
@@ -377,6 +396,14 @@ private:
         const ggml_tensor *  ids = nullptr;
         std::vector<int32_t> ids_data;
         std::vector<bool>    used;
+        std::vector<int32_t> ids_chunk; // the ids of an expert range (llama_moe_chunks)
+        // one gather kernel per range (LLAMA_MOE_GATHER, ggml_backend_cuda_gather_copy): the copies collected, the device
+        // addresses of host memory the GPU reads in place (per host tensor, and per GiB of other host memory: the arena)
+        std::vector<void *>       g_dst;
+        std::vector<const void *> g_src;
+        std::vector<size_t>       g_size;
+        std::unordered_map<const void *, intptr_t> host_dev;    // host tensor data -> device address - host address, or INTPTR_MIN
+        std::unordered_map<uintptr_t, intptr_t>    host_dev_gb; // (address >> 30) -> the same
 
         void reset() {
             ids = nullptr;
@@ -416,6 +443,28 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    // LLAMA_GRAPH_POOL=K (hydev): up to K more (scheduler, graph) pairs for ubatches of up to 8 tokens. Alternating batch shapes
+    // (an MTP draft's catch-up step and its 1-token steps, verify windows of varying size) then swap in their own allocated
+    // graph instead of rebuilding and reallocating it, and their CUDA graphs stay valid. Each scheduler allocates only what its
+    // graphs need
+    struct graph_pool_entry {
+        ggml_backend_sched_ptr sched;
+        llm_graph_result_ptr   res;
+        bool    active = false; // res holds the graph currently allocated in sched
+        int64_t used   = 0;
+    };
+    std::vector<graph_pool_entry> graph_pool;
+    int64_t graph_pool_clock = 0;
+    int     graph_pool_k     = -1; // pool size set by the MoE cache auto size (its VRAM budget), -1: LLAMA_GRAPH_POOL
+    size_t  n_pool_hits = 0, n_pool_misses = 0;
+    void graph_pool_reset();
+    // the scheduler made by sched_new, the only one reserved for the worst-case graph: ubatches of more than 8 tokens run in
+    // it (a pooled scheduler that took such a graph would allocate its own prefill-sized buffers, one per pool entry)
+    ggml_backend_sched * sched_main = nullptr;
+    void graph_pool_main();
+    // swaps a pooled (scheduler, graph) pair for this ubatch in, returns true if its graph can be reused as is
+    bool graph_pool_swap(const llama_ubatch & ubatch, const llama_memory_context_i * mctx, llm_graph_type gtype);
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

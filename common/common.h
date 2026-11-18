@@ -597,7 +597,8 @@ struct common_params {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
-    size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
+    size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers; SIZE_MAX: auto
+    size_t moe_cache_margin = SIZE_MAX; // auto size: device memory left free (+ the draft's GPU bytes); SIZE_MAX: by backend (common_moe_cache_margin)
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
@@ -1021,6 +1022,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
+size_t common_moe_cache_margin(size_t margin); // --moe-cache-margin-mib, SIZE_MAX: the default of the backend
 
 // apply --fit to mparams and cparams, no-op if params.fit_params is false
 void common_fit_apply(common_params & params, struct llama_model_params & mparams, struct llama_context_params & cparams);
@@ -1340,3 +1342,7 @@ struct common_prompt_checkpoint {
     void clear_tgt();
     void clear_dft();
 };
+
+// lc-: hands the buffers of a checkpoint about to be erased to a small pool; update_tgt/update_dft take a pooled buffer of the
+// same size instead of a fresh one, which costs ~44 ms per 112 MiB to fault in and zero (asrok)
+void common_prompt_checkpoint_recycle(common_prompt_checkpoint & cur);

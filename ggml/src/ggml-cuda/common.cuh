@@ -1275,6 +1275,8 @@ struct ggml_cuda_graph {
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
     uint64_t uid = 0;
+    uint64_t compat_uid = 0;  // the ggml graph uid whose compatibility check gave compat_ok (a reused graph is not walked again)
+    bool     compat_ok  = false;
     int64_t last_used_time = 0;
     struct node_properties {
         ggml_tensor node;
@@ -1442,10 +1444,37 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// GGML_CUDA_Q8_CACHE: q8_1 copies of matmul inputs, reused within one graph evaluation when several quantized matmuls
+// read the same input (q/k/v, qkv/gate, experts/shared expert)
+struct ggml_cuda_q8_cache_entry {
+    const ggml_tensor * base  = nullptr; // the tensor the input views, a graph node of this evaluation
+    const void *        data  = nullptr;
+    int64_t             ne[4] = {};
+    size_t              nb[4] = {};
+    uint64_t            epoch = 0;
+};
+static constexpr int    GGML_CUDA_Q8_CACHE_N    = 4;
+static constexpr size_t GGML_CUDA_Q8_CACHE_SIZE = 4u << 20; // per entry; larger inputs bypass the cache
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+    ggml_cuda_q8_cache_entry q8_cache[GGML_CUDA_Q8_CACHE_N];
+    char *   q8_cache_mem  = nullptr; // allocated once: captured CUDA graphs keep these addresses
+
+    // GGML_SCHED_BATCH_INPUTS=3: packed input uploads (ggml_backend_cuda_set_tensors_packed), two pinned/device slots
+    char *      pack_host[2] = {};
+    char *      pack_dev[2]  = {};
+    cudaEvent_t pack_ev[2]   = {};
+    int         pack_i       = 0;
+    // tandem.cpp gather copies (ggml_backend_cuda_gather_copy): a ring of pinned descriptor buffers the kernel reads in place
+    char *      gather_host[8] = {};
+    cudaEvent_t gather_ev[8]   = {};
+    int         gather_i       = 0;
+    uint64_t q8_cache_epoch = 1;
+    int      q8_cache_next  = 0;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
@@ -1586,7 +1615,15 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+    // MoE cache GPU fetch (LLAMA_MOE_GPU_FETCH): a negative id -(e+1) reads expert e in place from pinned host memory at
+    // host_x (host_gate for the fused gate) + e*host_nb instead of a cache slot
+    const char * host_x = nullptr;
+    const char * host_gate = nullptr;
+    uint64_t host_nb = 0;
 };
+
+// MoE cache GPU fetch registry (ggml-cuda.cu): the device address of a cache view's experts in pinned host memory, or nullptr
+const char * ggml_cuda_moe_fetch_host(const struct ggml_tensor * t);
 
 struct ggml_cuda_kernel_launch_params {
     dim3 block_nums;

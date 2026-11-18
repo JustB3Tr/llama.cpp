@@ -602,6 +602,10 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_HOST_ADD,
+        GGML_OP_MOE_DOORBELL,
+        GGML_OP_GET_ROWS_HOST,
+
         GGML_OP_COUNT,
     };
 
@@ -1520,6 +1524,11 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // op_params slot that marks a MUL_MAT_ID whose ids may lie outside [0, as->ne[2]): such pairs are skipped and their rows of
+    // the result are left as they are (expert ranges written into one result, LLAMA_MOE_CHUNKS); backends that do not check
+    // the mark must not be given such ops
+    #define GGML_MUL_MAT_ID_RANGED_PARAM 15
 
     // A: m columns, n rows,
     // B: p columns, n rows,
@@ -2678,6 +2687,44 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
+    // same, with two optional extensions:
+    //   ids (I32 [n_seqs]): the initial state of sequence i is states[ids[i]] (states: [S_v, S_v, H_v, n_rows]),
+    //       read straight from the recurrent cache instead of a gathered copy
+    //   dt, A (F32 [H_v]): g and beta are raw projections (scalar gate only, strided views allowed, same strides);
+    //       the op uses g = softplus(g + dt) * A and beta = sigmoid(beta)
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * states,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * dt,
+            struct ggml_tensor  * A,
+            int64_t               K);
+
+    // LLAMA_GDN_REPLAY (one sequence, scalar gate): as ggml_gated_delta_net_ext with K = 1, where
+    //   info (I32 [4]) = { S row of states, x row to replay, x row to write, tokens to replay }
+    //   x (F32 [n_x * k_max, rows]): per token k [S_k, H_k], v [S_v, H_v], raw g [H_v], raw beta [H_v]
+    // the op first replays info[3] kept tokens of row info[1] into the state, then, for at most k_max tokens, stores them in
+    // row info[2] and returns the state before them (the replayed one) in the state slot; for more tokens the final state
+    // (nothing is kept). The state slot of the result is the next S plane either way
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_replay(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * states,
+            struct ggml_tensor  * info,
+            struct ggml_tensor  * dt,
+            struct ggml_tensor  * A,
+            struct ggml_tensor  * x,
+            int                   k_max);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
@@ -2731,6 +2778,18 @@ extern "C" {
             struct ggml_tensor  * gate,
             float                 scale);
 
+    // hc_pre with the weights as gate logits (DeepSeek V4): weights[h, t] = sigmoid(mix[h, t]*scale[0] + base[h]) + eps,
+    // the same operations as mul -> add -> sigmoid -> scale_bias(1, eps), without contraction into an fma
+    //   mix [hc, n_tokens] (may be a view), scale [>= 1], base [hc]
+    //
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_pre_affine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * mix,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 eps);
+
     // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens],
     //          post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]
     //          -> [n_embd, hc, n_tokens]
@@ -2764,6 +2823,31 @@ extern "C" {
             struct ggml_tensor  * score,
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
+
+    // as ggml_dsv4_hc_post, with post given as gate logits (DeepSeek V4): the op uses
+    // scale_out * sigmoid(post[h, t]*scale[0] + base[h]), the same operations as mul -> add -> sigmoid -> scale
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_post_affine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * post,
+            struct ggml_tensor  * comb,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 scale_out);
+
+    // as ggml_dsv4_hc_post, with post given as logits: the op uses scale_out * sigmoid(scale_in * post).
+    // add/add_gate (optional, [n_embd, n_tokens] and [1, n_tokens]): x is replaced by x + add * sigmoid(add_gate)
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_post_sig(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * post,
+            struct ggml_tensor  * comb,
+            float                 scale_in,
+            float                 scale_out,
+            struct ggml_tensor  * add,
+            struct ggml_tensor  * add_gate);
 
     // custom operators
 
@@ -2869,6 +2953,56 @@ extern "C" {
             struct ggml_tensor  * m,
             struct ggml_tensor  * v,
             struct ggml_tensor  * adamw_params); // parameters such as the learning rate
+
+    // a + data, where data is F32 in pinned host memory with the shape of a (contiguous), written by the host while the graph runs:
+    // the backend waits until flag[0] != flag[1] (the host increments flag[0] after writing data), then sets flag[1] = flag[0] and
+    // flag[2] = how long it waited (ns); flag[3] counts waits that timed out. data and flag must stay valid while the graph is used
+    // data NULL (doorbell late pass join): flag is a struct ggml_moe_db; the backend waits for that layer's late uploads (started
+    // by its ggml_moe_doorbell on a second stream), then returns a unchanged
+    GGML_API struct ggml_tensor * ggml_host_add(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        const float         * data,
+        uint32_t            * flag);
+
+    // MoE cache doorbell: hands the selected experts of a layer to a host thread while the graph runs, and returns their slots
+    // db is a control block in pinned host memory, see struct ggml_moe_db: the backend writes ids (and x, w if not NULL) into it,
+    // sets req = ack + 1 and waits until the host sets ack = req, after it wrote the slots of ids (at ans_off) and the uploads
+    // (at ans_off + slots_cap*4: n_fill, pad, then n_fill ggml_moe_db_fill); the backend copies both to the device, then copies
+    // each upload from host to device memory itself (zero-copy reads)
+    // late pass (pad[0] = K > 0 and op param 3 set by the graph's join, see ggml_host_add): after the uploads, the answer holds
+    // n_late, pad, max_fill late uploads, then the late slots [8*K] and their ranks in ids [8*K] (I32, per token K each); the
+    // backend copies them like the rest and does the late uploads on a second stream, joined by the late pass. The backend sets
+    // n_fill = K when the graph joins (the host does the late split only then)
+    // result: I32 [n_ids + GGML_MOE_DB_SCRATCH(max_fill, K)], the slots of ids first (the rest is scratch)
+    struct ggml_moe_db {
+        uint32_t req, ack;     // written by the backend / by the host
+        uint32_t n_tok, n_used, hyb;
+        uint32_t n_fill;       // late pass: K when this graph joins the late uploads, else 0 (written by the backend)
+        uint32_t wait_ns;      // how long the backend waited for ack, last call
+        uint32_t timeouts;     // waits that gave up after 2 s
+        uint32_t ids_off, x_off, w_off, ans_off, slots_cap, max_fill; // byte offsets from the block, capacities
+        uint32_t pad[2];       // pad[0]: K, the late pass's slots per token (0 off), set by the host
+    };
+    struct ggml_moe_db_fill { uint64_t src, dst, n; }; // host source, device destination, bytes
+    // scratch: from word (n_ids + 1) & ~1: n_fill, pad, then max_fill ggml_moe_db_fill; with K: n_late, pad, max_fill
+    // ggml_moe_db_fill, late slots [8*K], late ranks [8*K]
+    #define GGML_MOE_DB_SCRATCH(max_fill, k) ((k) > 0 ? 5 + 12*(max_fill) + 16*(k) : 3 + 6*(max_fill))
+    #define GGML_MOE_DB_LATE_OFF(max_fill) (4 + 12*(max_fill)) // words from the scratch start to the late slots
+    GGML_API struct ggml_tensor * ggml_moe_doorbell(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,   // I32 [n_tok*n_used], contiguous
+        struct ggml_tensor  * x,     // F32 [n_embd, n_tok] or NULL
+        struct ggml_tensor  * w,     // F32 [n_used*n_tok] or NULL
+        struct ggml_moe_db  * db,
+        int                   n_used);
+
+    // rows ids of w, read by the backend from host memory it can address (pinned and mapped, e.g. registered), as F32
+    // [w->ne[0], n_ids]; w is only described (type, row size, data pointer), it is not a source, so the op runs where ids is
+    GGML_API struct ggml_tensor * ggml_get_rows_host(
+        struct ggml_context * ctx,
+        const struct ggml_tensor * w,
+        struct ggml_tensor  * ids);
 
     // stochastic gradient descent step (with weight decay)
     GGML_API struct ggml_tensor * ggml_opt_step_sgd(

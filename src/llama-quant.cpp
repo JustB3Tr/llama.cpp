@@ -301,7 +301,19 @@ static void llama_tensor_dequantize_impl(
 
 static bool tensor_allows_quantization(const llama_model_quantize_params * params, llm_arch arch, const ggml_tensor * tensor) {
     // trivial checks first -- no string ops needed
-    if (params->only_copy)       return false;
+    if (params->only_copy) {
+        // COPY with --tensor-type: requantize only the tensors an override names, copy everything else
+        if (params->tt_overrides == nullptr) {
+            return false;
+        }
+        const std::string name = ggml_get_name(tensor);
+        for (const auto * p = params->tt_overrides; p->pattern != nullptr; p++) {
+            if (std::regex_search(name, std::regex(p->pattern))) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     // quantize only 2D+ tensors (matrices, experts, conv kernels)
     if (ggml_n_dims(tensor) < 2) return false;
@@ -755,6 +767,17 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
 // outer wrapper: determine the ggml_type that this tensor should be quantized to
 static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_model_quantize_params * params, const ggml_tensor * tensor, ggml_type default_type, const tensor_metadata & tm) {
     if (!tensor_allows_quantization(params, qs.model.arch, tensor)) {
+        return tensor->type;
+    }
+    if (params->only_copy) { // COPY with --tensor-type: the override's type, nothing else
+        const std::string tensor_name(tensor->name);
+        for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
+            if (std::regex_search(tensor_name, pattern)) {
+                LLAMA_LOG_WARN("%s: %-36s - applying manual override: %s -> %s\n",
+                               __func__, tensor_name.c_str(), ggml_type_name(tensor->type), ggml_type_name(qtype));
+                return tensor_type_fallback(qs, tensor, qtype);
+            }
+        }
         return tensor->type;
     }
     if (params->token_embedding_type < GGML_TYPE_COUNT && tm.category == tensor_category::TOKEN_EMBD) {

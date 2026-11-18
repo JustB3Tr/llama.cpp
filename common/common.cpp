@@ -4,6 +4,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "../src/llama-prof.h"
 
 #include "../src/llama-ext.h"
 
@@ -386,7 +387,54 @@ bool parse_cpu_mask(const std::string & mask, bool (&boolmask)[GGML_MAX_N_THREAD
     return true;
 }
 
+// tandem.cpp release defaults: the tuned paths that are exact (or differ only in rounding, as any kernel choice) and that
+// the benchmarks use. Applied to the environment when a variable is unset, before anything reads it; VAR=0 turns one off.
+// Model-specific paths (Qwen3.8 GDN/conv/PLE/hc, MTP) only act on their architecture. Not set here: LLAMA_MTP_DRAFT_VOCAB
+// (a draft vocabulary subset whose size depends on the model).
+static const char * const lc_release_defaults[][2] = {
+    { "GGML_CUDA_GRAPH_KEY_SHAPE", "1"    }, // one CUDA graph per batch shape (speculative windows do not evict each other)
+    { "GGML_SCHED_BATCH_INPUTS",   "3"    }, // the graph's host inputs in one packed upload
+    { "GGML_CUDA_MMVF_MAX",        "8"    }, // vector kernel for float weights up to 8 columns
+    { "GGML_CUDA_Q8_CACHE",        "1"    }, // reuse the q8_1 activations of a matvec input across matvecs
+    { "LLAMA_GRAPH_POOL",          "6"    }, // keep 6 more allocated graphs for alternating small batch shapes
+    { "LLAMA_SRV_USER_BREAK",      "0"    }, // server: no prompt checkpoint at every user message
+    { "LLAMA_MOE_CPU",             "auto" }, // MoE cache: the CPU computes a measured share of the missed experts
+    { "LLAMA_MOE_PREFILL_CPU",     "auto" }, // ... and of the prompt batches' missed experts
+    { "LLAMA_MOE_CPU_RB",          "64"   }, // CPU expert job: 64 gate/up rows per work item
+    { "LLAMA_MOE_CPU_DOWN_PE",     "64"   }, // CPU expert job: down rows per expert, 64 per item
+    { "LLAMA_HC_FUSE",             "1"    }, // Qwen3.8 / DS4 hc: scale folded into the weights
+    { "GGML_CUDA_HC_MIX_FUSE",     "1"    }, // hc mix block in 2 kernels (different rounding)
+    { "LLAMA_GDN_DIRECT",          "1"    }, // Qwen3.8 GDN: state read from the cache by row
+    { "LLAMA_GDN_GATES",           "1"    }, // Qwen3.8 GDN: beta and alpha in one matvec
+    { "LLAMA_GDN_REPLAY",          "1"    }, // Qwen3.8 GDN: one state plane + replayed inputs instead of rollback snapshots
+    { "LLAMA_CONV_CONT",           "1"    }, // Qwen3.8 conv: contiguous token input
+    { "LLAMA_CONV_TAIL",           "1"    }, // Qwen3.8 conv: rollback slots from the strided tail
+    { "LLAMA_PLE_GPU",             "1"    }, // per-layer embeddings read by the GPU from pinned host memory
+    { "LLAMA_MTP_DEFER",           "1"    }, // MTP: catch-up decode deferred to the next draft
+};
+
+static void lc_apply_release_defaults() {
+    if (const char * off = getenv("LLAMA_MOE_NO_DEFAULTS"); off && atoi(off) != 0) {
+        return;
+    }
+    std::string set;
+    for (const auto & d : lc_release_defaults) {
+        if (getenv(d[0]) == nullptr) {
+#if defined(_WIN32)
+            _putenv_s(d[0], d[1]);
+#else
+            setenv(d[0], d[1], 0);
+#endif
+            set += string_format(" %s=%s", d[0], d[1]);
+        }
+    }
+    if (!set.empty()) {
+        LOG_INF("tandem.cpp defaults (unset variables; LLAMA_MOE_NO_DEFAULTS=1 for none):%s\n", set.c_str());
+    }
+}
+
 void common_init() {
+    lc_apply_release_defaults();
 #if defined(_WIN32)
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
@@ -1271,6 +1319,7 @@ void common_fit_apply(common_params & params, llama_model_params & mparams, llam
     common_params params_dft = common_base_params_to_speculative(params);
 
     auto mparams_dft = common_model_params_to_llama(params_dft);
+
     auto cparams_dft = common_context_params_to_llama(params_dft);
     if (spec_mtp) {
         cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
@@ -1736,6 +1785,17 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     return mparams;
 }
 
+// the device memory the auto cache size leaves free when --moe-cache-margin-mib is not given: 512 MiB on CUDA, where it covers
+// the kernels loaded on first use (lazy module loading: 256 MiB ran out in the first prompt's MMQ launch, pcbox1 5070 Ti; 512
+// left >= 513 MiB unused through W1 + W3), 1024 MiB on ROCm, whose runtime and kernel scratch take ~900 MiB more than the
+// accounted buffers (cfl1 7900 XTX: 1024 left 143 MiB at the least, 512 failed)
+size_t common_moe_cache_margin(size_t margin) {
+    if (margin != SIZE_MAX) {
+        return margin;
+    }
+    return (size_t) (ggml_backend_reg_by_name("ROCm") != nullptr ? 1024 : 512)*1024*1024;
+}
+
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
 
@@ -1772,7 +1832,53 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
-    cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_cache_size   = params.moe_cache_size;
+    cparams.moe_cache_margin = common_moe_cache_margin(params.moe_cache_margin);
+    if (params.moe_cache_size == SIZE_MAX && params.speculative.has_dft()) {
+        // the draft model is loaded after this context: keep its weights (plus its KV cache and graphs, ~512 MiB) free too
+        const auto & dft = params.speculative.draft;
+        std::error_code ec;
+        size_t sz = std::filesystem::file_size(dft.mparams.path, ec);
+        if (ec) {
+            sz = 0;
+        }
+        // not counted: its token_embd, which stays in host memory (the input layer) unless a draft override (-otd) places
+        // it, and every tensor a draft override sends to host memory (e.g. the full head with a draft vocabulary)
+        if (sz > 0) {
+            gguf_init_params gp = { /* .no_alloc = */ true, /* .ctx = */ nullptr };
+            ggml_context * meta = nullptr;
+            gp.ctx = &meta;
+            gguf_context_ptr g(gguf_init_from_file(dft.mparams.path.c_str(), gp));
+            for (ggml_tensor * t = meta ? ggml_get_first_tensor(meta) : nullptr; t != nullptr; t = ggml_get_next_tensor(meta, t)) {
+                const llama_model_tensor_buft_override * hit = nullptr;
+                for (const auto & o : dft.tensor_buft_overrides) {
+                    if (o.pattern != nullptr && std::regex_search(ggml_get_name(t), std::regex(o.pattern))) {
+                        hit = &o;
+                        break;
+                    }
+                }
+                const bool host = hit ? hit->buft != nullptr && ggml_backend_buft_is_host(hit->buft) : strcmp(ggml_get_name(t), "token_embd.weight") == 0;
+                if (host && ggml_nbytes(t) < sz) {
+                    sz -= ggml_nbytes(t);
+                }
+            }
+            if (meta) {
+                ggml_free(meta);
+            }
+        }
+        // LLAMA_MOE_DRAFT_EXTRA_MIB: that allowance (default 512)
+        const char * dx = getenv("LLAMA_MOE_DRAFT_EXTRA_MIB");
+        cparams.moe_cache_margin += sz + (size_t) (dx ? std::max(0, atoi(dx)) : 512)*1024*1024;
+        cparams.moe_cache_margin_draft = cparams.moe_cache_margin - common_moe_cache_margin(params.moe_cache_margin);
+        if (dft.p_min > 0.0f) {
+            // drafts cut short by p_min give verify batches of every size up to n_max+1, and each size keeps its own CUDA
+            // graphs (~150 MiB on DeepSeek-V4.1, measured on rome); a full-length draft always verifies the same size.
+            // LLAMA_MOE_PMIN_MARGIN_MIB sets the MiB per extra size (default 160)
+            const char * pm = getenv("LLAMA_MOE_PMIN_MARGIN_MIB");
+            cparams.moe_cache_margin += (size_t) std::max(dft.n_max, 0)*(pm ? (size_t) atoi(pm) : 160)*1024*1024;
+            cparams.moe_cache_margin_draft = cparams.moe_cache_margin - common_moe_cache_margin(params.moe_cache_margin);
+        }
+    }
 
     return cparams;
 }
@@ -2410,6 +2516,38 @@ void common_prompt_checkpoint::update_pos(
     this->pos_max  = pos_max;
 }
 
+static std::mutex g_ckpt_pool_mu;
+static std::vector<std::vector<uint8_t>> g_ckpt_pool;
+
+void common_prompt_checkpoint_recycle(common_prompt_checkpoint & cur) {
+    static const bool on = !getenv("LLAMA_CKPT_POOL") || atoi(getenv("LLAMA_CKPT_POOL")) != 0;
+    if (!on) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_ckpt_pool_mu);
+    for (auto * v : { &cur.data_tgt, &cur.data_dft }) {
+        if (v->size() >= (1u << 20) && g_ckpt_pool.size() < 8) {
+            g_ckpt_pool.push_back(std::move(*v));
+            v->clear();
+        }
+    }
+}
+
+// a pooled buffer of exactly n bytes (its pages are already in memory), else dst is left as it is
+static void common_ckpt_take(std::vector<uint8_t> & dst, size_t n) {
+    if (dst.size() == n) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_ckpt_pool_mu);
+    for (auto it = g_ckpt_pool.begin(); it != g_ckpt_pool.end(); ++it) {
+        if (it->size() == n) {
+            dst.swap(*it);
+            g_ckpt_pool.erase(it);
+            return;
+        }
+    }
+}
+
 void common_prompt_checkpoint::update_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
@@ -2420,8 +2558,13 @@ void common_prompt_checkpoint::update_tgt(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
+    {
+    llama_prof_scope ps("ckpt.tgt.resize");
+    common_ckpt_take(data_tgt, ckpt_size);
     data_tgt.resize(ckpt_size);
+    }
 
+    llama_prof_scope ps("ckpt.tgt.get");
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
@@ -2438,8 +2581,13 @@ void common_prompt_checkpoint::update_dft(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
+    {
+    llama_prof_scope ps("ckpt.dft.resize");
+    common_ckpt_take(data_dft, ckpt_size);
     data_dft.resize(ckpt_size);
+    }
 
+    llama_prof_scope ps("ckpt.dft.get");
     const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);

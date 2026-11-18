@@ -1742,6 +1742,35 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
+// see ggml_host_add
+static void ggml_compute_forward_host_add(struct ggml_tensor * dst) {
+    uint64_t p[2];
+    memcpy(p, dst->op_params, sizeof(p));
+    const float       * data = (const float *) (uintptr_t) p[0];
+    volatile uint32_t * flag = (volatile uint32_t *) (uintptr_t) p[1];
+    GGML_ASSERT(data != NULL && "the doorbell late pass join is only implemented on CUDA");
+
+    const uint32_t seen = flag[1];
+    const int64_t  t0   = ggml_time_us();
+    uint32_t v;
+    while ((v = flag[0]) == seen) {
+        if (ggml_time_us() - t0 > 2000000) {
+            flag[3] = flag[3] + 1;
+            break;
+        }
+    }
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    flag[1] = v;
+    flag[2] = (uint32_t) ((ggml_time_us() - t0)*1000);
+
+    const float * a = (const float *) dst->src[0]->data;
+    float       * d = (float *) dst->data;
+    const int64_t n = ggml_nelements(dst);
+    for (int64_t i = 0; i < n; i++) {
+        d[i] = a[i] + data[i];
+    }
+}
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -2154,6 +2183,21 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_opt_step_sgd(params, tensor);
             }
             break;
+        case GGML_OP_HOST_ADD:
+            {
+                if (params->ith == 0) {
+                    ggml_compute_forward_host_add(tensor);
+                }
+            }
+            break;
+        case GGML_OP_MOE_DOORBELL:
+            {
+                GGML_ABORT("MOE_DOORBELL is only implemented on CUDA");
+            }
+        case GGML_OP_GET_ROWS_HOST:
+            {
+                GGML_ABORT("GET_ROWS_HOST is only implemented on CUDA");
+            }
         case GGML_OP_NONE:
             {
                 // nop
@@ -2502,6 +2546,12 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_OPT_STEP_SGD:
             {
                 n_tasks = n_threads;
+            } break;
+        case GGML_OP_HOST_ADD:
+        case GGML_OP_MOE_DOORBELL:
+        case GGML_OP_GET_ROWS_HOST:
+            {
+                n_tasks = 1;
             } break;
         case GGML_OP_NONE:
             {

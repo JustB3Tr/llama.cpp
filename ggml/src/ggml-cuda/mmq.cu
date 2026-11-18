@@ -5,6 +5,13 @@
 
 #include <cstdint>
 
+static __global__ void mmq_fill_i32(int32_t * __restrict__ x, const int32_t v, const int n) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) {
+        x[i] = v;
+    }
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -321,6 +328,10 @@ void ggml_cuda_mul_mat_q(
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
+        // ids of experts outside [0, ne02) (an expert range of a large batch, see llama_moe_cache::get_chunks) are skipped:
+        // the helper leaves their entries of ids_src1 unwritten, so they point at a row the matrix multiplication does not read
+        // (the last compact row, unused if any pair is skipped) or, for the forward map, at a valid column
+        mmq_fill_i32<<<(ne_get_rows + 255)/256, 256, 0, stream>>>(ids_src1.get(), dedup_bcast ? ne_get_rows - 1 : 0, ne_get_rows);
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
             ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
         CUDA_CHECK(cudaGetLastError());

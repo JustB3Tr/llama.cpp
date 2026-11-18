@@ -98,6 +98,14 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        b,
             ggml_tensor *        s,
             int                  il);
+
+    // when set, s is the whole state cache [S_v, S_v, H_v, n_rows] and the fused op reads row
+    // gdn_state_ids[i] for sequence i (single-sequence ubatches only, see qwen4exp)
+    ggml_tensor * gdn_state_ids = nullptr;
+    // when set, g and b are the raw alpha/beta projections and the fused op applies
+    // g = softplus(g + gdn_gate_dt) * gdn_gate_a, b = sigmoid(b)
+    ggml_tensor * gdn_gate_dt = nullptr;
+    ggml_tensor * gdn_gate_a  = nullptr;
 };
 
 struct llm_build_lfm_base : public llm_graph_context {
@@ -2768,10 +2776,15 @@ struct llama_model_qwen4exp : public llama_model_base {
         graph(const llama_model & model, const llm_graph_params & params, no_build) :
             llm_build_delta_net_base(params), model(model) {}
 
+        // LLAMA_HC_FUSE: the shared expert's output and gate logit, added by the next hc combine instead of a separate add
+        ggml_tensor * shexp_pend      = nullptr;
+        ggml_tensor * shexp_gate_pend = nullptr;
+
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         struct hc_mix {
             ggml_tensor * cur;     // the mixed [n_embd, T] stream
             ggml_tensor * inject;  // [hc, T] scatter weights, null when the inject weights are null
+            float inject_scale = 1.0f; // scale the combine still applies to inject (LLAMA_HC_FUSE)
         };
 
         hc_mix build_hc_mix(
@@ -2784,10 +2797,10 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il);
 
         ggml_tensor * build_hc_combine(
-                    ggml_tensor * residual,
-                    ggml_tensor * block_out,
-                    ggml_tensor * inject,
-                            int   il);
+                    ggml_tensor *  residual,
+                    ggml_tensor *  block_out,
+                    const hc_mix & mix,
+                            int    il);
 
         ggml_tensor * build_layer_attn(
               llm_graph_input_attn_kv * inp_attn,

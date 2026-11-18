@@ -11117,8 +11117,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
     GGML_ASSERT(ggml_is_contiguous_rows(src_k));
     GGML_ASSERT(ggml_is_contiguous_rows(src_v));
-    GGML_ASSERT(ggml_is_contiguous(src_g));
-    GGML_ASSERT(ggml_is_contiguous(src_beta));
+    GGML_ASSERT(dst->src[7] || ggml_is_contiguous(src_g));
+    GGML_ASSERT(dst->src[7] || ggml_is_contiguous(src_beta));
     GGML_ASSERT(ggml_is_contiguous(src_state));
 
     GGML_ASSERT(src_g->ne[0] == 1 || src_g->ne[0] == S_v);
@@ -11186,7 +11186,8 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
         // copy input state into the working buffer and operate in-place
         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
-        const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+        const int64_t s_row = dst->src[6] ? (int64_t) ((const int32_t *) dst->src[6]->data)[iv3] : iv3;
+        const float * s_in = state_in_base + s_row * state_seq_stride + iv1 * S_v * S_v;
         memcpy(s_out, s_in, S_v * S_v * sizeof(float));
 
         // attn output pointer for first token of this (head, seq)
@@ -11197,8 +11198,18 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
             const float * v_d = (const float *)((const char *)src_v->data + iv3 * nbv3 + t * nbv2 + iv1 * nbv1);
 
-            const float beta_val = *(const float *)((const char *)src_beta->data + iv3 * nbb3 + t * nbb2 + iv1 * nbb1);
+            float beta_val = *(const float *)((const char *)src_beta->data + iv3 * nbb3 + t * nbb2 + iv1 * nbb1);
             const float * g_d    =  (const float *)((const char *)src_g->data    + iv3 * nbg3 + t * nbg2 + iv1 * nbg1);
+            // raw gates (ggml_gated_delta_net_ext): the same float operations as add -> softplus -> mul and sigmoid
+            float g_raw;
+            if (dst->src[7]) {
+                beta_val = 1.0f / (1.0f + expf(-beta_val));
+                volatile float x = g_d[0] + ((const float *) dst->src[7]->data)[iv1];
+                const float sp = (x > 20.0f) ? (float) x : logf(1.0f + expf(x));
+                volatile float gl = sp * ((const float *) dst->src[8]->data)[iv1];
+                g_raw = gl;
+                g_d = &g_raw;
+            }
 
             // state is stored transposed: s_out[j*S_v + i] = S[i][j]
             // so row j of s_out = column j of S (contiguous access)
@@ -11294,6 +11305,9 @@ static void ggml_compute_forward_gated_delta_net_f32(
 void ggml_compute_forward_gated_delta_net(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    // LLAMA_GDN_REPLAY (ggml_gated_delta_net_replay) is CUDA/HIP only; the model enables it only with the GDN layers there
+    GGML_ASSERT(dst->src[9] == nullptr && "gated_delta_net replay: CUDA/HIP only");
+
     const ggml_tensor * src0 = dst->src[0];
 
     switch (src0->type) {
@@ -11465,6 +11479,9 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
 
     const float scale = ggml_get_op_params_f32(dst, 0);
     const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
+    const bool  affine  = ggml_get_op_params_i32(dst, 2) != 0; // weights are gate logits (ggml_dsv4_hc_pre_affine)
+    const float aff_eps = affine ? ggml_get_op_params_f32(dst, 3) : 0.0f;
+    const float aff_s   = affine ? *(const float *) dst->src[2]->data : 0.0f;
 
     GGML_ASSERT(dst->ne[0] == n_embd);
     GGML_ASSERT(dst->ne[1] == n_tokens);
@@ -11502,6 +11519,13 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
                 wv = 1.0f / (1.0f + expf(-gv));
             } else {
                 wv = *(const float *) ((const char *) weights->data + ih*nbw0 + it*nbw1);
+                if (affine) {
+                    // mul -> add -> sigmoid -> scale_bias(1, eps), kept separate as the unfused ops
+                    volatile float m = wv * aff_s;
+                    volatile float v = m + *(const float *) ((const char *) dst->src[3]->data + ih*dst->src[3]->nb[0]);
+                    volatile float g = 1.0f / (1.0f + expf(-v));
+                    wv = g + aff_eps;
+                }
             }
             sum += xv * wv;
         }
@@ -11581,13 +11605,33 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
     const int64_t ir0 = dr * ith;
     const int64_t ir1 = MIN(ir0 + dr, nr);
 
+    const int   post_sig = ggml_get_op_params_i32(dst, 0); // post holds logits: post_out * sigmoid(post_in * post)
+    const float post_in  = ggml_get_op_params_f32(dst, 1);
+    const float post_out = ggml_get_op_params_f32(dst, 2);
+
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t i0     = ir % n_embd;
         const int64_t idst   = (ir / n_embd) % hc;
         const int64_t it     = ir / (n_embd * hc);
 
-        const float xv = *(const float *) ((const char *) x->data    + i0*nbx0 + it*nbx1);
-        const float pv = *(const float *) ((const char *) post->data + idst*nbp0 + it*nbp1);
+        float xv = *(const float *) ((const char *) x->data    + i0*nbx0 + it*nbx1);
+        if (dst->src[4]) {
+            const ggml_tensor * add = dst->src[4];
+            const ggml_tensor * ag  = dst->src[5];
+            const float g = 1.0f / (1.0f + expf(-*(const float *) ((const char *) ag->data + it*ag->nb[1])));
+            const float a = *(const float *) ((const char *) add->data + i0*add->nb[0] + it*add->nb[1]);
+            volatile float prod = a * g; // keep mul and add separate, as the unfused ops
+            xv = xv + prod;
+        }
+        float pv = *(const float *) ((const char *) post->data + idst*nbp0 + it*nbp1);
+        if (post_sig == 2) {
+            // gate logits (ggml_dsv4_hc_post_affine): mul -> add -> sigmoid -> scale, kept separate as the unfused ops
+            volatile float m = pv * *(const float *) dst->src[6]->data;
+            volatile float v = m + *(const float *) ((const char *) dst->src[7]->data + idst*dst->src[7]->nb[0]);
+            pv = post_out * (1.0f / (1.0f + expf(-v)));
+        } else if (post_sig) {
+            pv = post_out * (1.0f / (1.0f + expf(-(post_in * pv))));
+        }
 
         float sum = xv * pv;
         if (comb) {

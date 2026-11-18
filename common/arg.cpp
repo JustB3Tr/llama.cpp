@@ -957,6 +957,18 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         params.tensor_buft_overrides.push_back({nullptr, nullptr});
     }
 
+    // an MTP draft over a vocabulary subset (LLAMA_MTP_DRAFT_VOCAB) reads only its copy of the subset's rows (made next to the
+    // MTP layer): its full head stays in host memory unless a draft override places it (Qwen3.8: 341 MiB of VRAM for the cache)
+    if (const char * dv = getenv("LLAMA_MTP_DRAFT_VOCAB"); dv && *dv && strcmp(dv, "0") != 0 &&
+            std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end()) {
+        bool placed = false;
+        for (const auto & o : params.speculative.draft.tensor_buft_overrides) {
+            placed = placed || (o.pattern != nullptr && std::regex_search("output.weight", std::regex(o.pattern)));
+        }
+        if (!placed) {
+            params.speculative.draft.tensor_buft_overrides.push_back({ "^output\\.weight$", ggml_backend_cpu_buffer_type() });
+        }
+    }
     if (!params.speculative.draft.tensor_buft_overrides.empty()) {
         params.speculative.draft.tensor_buft_overrides.push_back({nullptr, nullptr});
     }
@@ -1318,6 +1330,30 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             exit(0);
         }
         params.lr.init();
+        // MoE cache: prompts in 4096-token ubatches (LLAMA_MOE_UBATCH=N, 0: keep -ub) when -b/-ub are left at their defaults.
+        // Each ubatch streams every expert it uses that is not in the VRAM cache, so a 16k prompt at -ub 512 streamed the
+        // experts 31 times (pcbox1 128 GB + 5090, Qwen3.8 IQ3_S, 15.8k tokens: TTFT 19.4 s at 512, 10.1 at 2048, 7.3 at 4096;
+        // decode unchanged). The compute buffer grows (1.5 GiB at 4096 vs 0.24), taken from the auto-sized cache. Set here,
+        // on the parsed params, because the server sizes its batches from params.n_batch. Draft contexts keep 512 (their
+        // compute buffers are allocated after the cache): -ubd for a draft model, LLAMA_MTP_UBATCH for an MTP head.
+        if (params.moe_cache_size != 0 && params.n_ubatch == 512 && params.n_batch == 2048) {
+            const char * e = getenv("LLAMA_MOE_UBATCH");
+            const int ub = e ? atoi(e) : 4096;
+            if (ub > 0) {
+                params.n_ubatch = ub;
+                params.n_batch  = std::max(params.n_batch, ub);
+                if (params.speculative.draft.n_ubatch == 0) {
+                    params.speculative.draft.n_ubatch = 512;
+                }
+                if (getenv("LLAMA_MTP_UBATCH") == nullptr) {
+#if defined(_WIN32)
+                    _putenv_s("LLAMA_MTP_UBATCH", "512");
+#else
+                    setenv("LLAMA_MTP_UBATCH", "512", 0);
+#endif
+                }
+            }
+        }
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
         ctx_arg.params = params_org;
@@ -2786,15 +2822,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
-        {"--moe-cache-mib"}, "N",
-        "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)",
+        {"--moe-cache-mib"}, "N|auto",
+        "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split); "
+        "'auto': the device memory left after the model, the KV cache and the compute buffers, minus --moe-cache-margin-mib "
+        "and the draft model (default: 0, disabled)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.moe_cache_size = SIZE_MAX;
+                return;
+            }
+            const int v = std::stoi(value);
+            if (v < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_cache_size = (size_t) v*1024*1024;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
+    add_opt(common_arg(
+        {"--moe-cache-margin-mib"}, "N",
+        "with --moe-cache-mib auto: device memory in MiB left free (default: 512 on CUDA, 1024 on ROCm; a draft model's GPU bytes are added)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
-            params.moe_cache_size = (size_t) value*1024*1024;
+            params.moe_cache_margin = (size_t) value*1024*1024;
         }
-    ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
+    ).set_env("LLAMA_ARG_MOE_CACHE_MARGIN_MIB"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

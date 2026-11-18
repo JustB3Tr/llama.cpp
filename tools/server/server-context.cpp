@@ -2,6 +2,8 @@
 #include <atomic>
 #include <thread>
 #include "base64.hpp"
+#include "../../src/llama-prof.h"
+#include "../../src/llama-moe-cache.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-decision.h"
@@ -1013,6 +1015,191 @@ static bool add_mtmd_chunk(const server_slot & slot, const mtmd_input_chunk * ch
 // server_context_impl (private implementation)
 //
 
+// LLAMA_SPEC_AUTO=1 (opt-in): the draft count of each round is chosen online, up to the configured maximum. The best
+// count depends mostly on the setup (model, quant, cache size, machine); single round times swing with the text (how
+// many experts miss) and drift while a hybrid cache warms up, so counts are only compared on rounds timed close together:
+//   calibration: the counts take turns in blocks of N_BLOCK rounds (the first N_SKIP after a change are not timed: the
+//   new batch shapes rebuild and recapture graphs, ~10 ms resident); after two turns a count scoring 15% below the best
+//   leaves the rotation; when every remaining count has N_CAL timed rounds, the best one is chosen;
+//   then: every N_RECHECK rounds one block re-times a neighbour of the choice (alternately below and above), compared
+//   with the choice's own last 16 rounds; the choice moves to it for a 5% better score.
+// The score of a count n is the expected tokens per time E(n)/R(n): R(n) the trimmed mean (middle half) of the wall
+// times from one verify to the next (drafting included), E(n) = 1 + a_1 + a_1 a_2 + ... with a_k = P(k-th draft
+// accepted | the ones before were), from decayed counts. Where an extra verify token is expensive (the hybrid at a small
+// cache, slow CPU experts) fewer drafts win; resident, the maximum usually stays.
+struct server_spec_auto {
+    static constexpr int N_CAP  = 16;
+    static constexpr int N_WIN  = 64;  // timed rounds kept per count
+    static constexpr int N_CAL  = 24;  // timed rounds per count before the first choice
+    static constexpr int N_SKIP = 2;
+    static constexpr int N_BLOCK = 6;
+    static constexpr int N_RECHECK = 512;
+    bool    on = false;
+    int     cap = 0;
+    double  win[N_CAP + 1][N_WIN] = {};
+    int     nS[N_CAP + 1] = {};        // timed rounds per count
+    double  tried[N_CAP + 1] = {}, ok[N_CAP + 1] = {};
+    bool    active[N_CAP + 1] = {};    // still in the calibration rotation
+    int     turns = 0;                 // completed calibration turns
+    int64_t t_last = 0;
+    int64_t rounds = 0;
+    int64_t picked[N_CAP + 1] = {};
+    int     n_best = 0;                // the choice (0: calibrating)
+    int     blk_n = 0, blk_left = 0;   // the block in progress
+    int     blk_from = 0;              // nS[blk_n] when a re-check block started
+    double  ref_score = 0.0;           // the choice's score just before a re-check block
+    int64_t last_check = 0;
+    int     run_n = 0, run_len = 0;
+    int64_t n_switch = 0;
+
+    void init(int n_max) {
+        const char * e = getenv("LLAMA_SPEC_AUTO");
+        on  = e && atoi(e) != 0 && n_max > 1;
+        cap = std::min(n_max, N_CAP);
+        for (int k = 1; k <= cap; ++k) {
+            active[k] = true;
+        }
+    }
+    // trimmed mean of the last m timed rounds of count n (all kept ones for m = 0)
+    double R(int n, int m = 0) const {
+        const int have = std::min(nS[n], N_WIN);
+        m = m > 0 ? std::min(m, have) : have;
+        if (m == 0) {
+            return 0.0;
+        }
+        double v[N_WIN];
+        for (int i = 0; i < m; ++i) {
+            v[i] = win[n][(nS[n] - 1 - i) % N_WIN];
+        }
+        std::sort(v, v + m);
+        const int i0 = m/4, i1 = std::max(i0 + 1, m - m/4);
+        double sum = 0.0;
+        for (int i = i0; i < i1; ++i) {
+            sum += v[i];
+        }
+        return sum/(i1 - i0);
+    }
+    double expect(int n) const {
+        double e = 1.0, p = 1.0;
+        for (int k = 1; k <= n; ++k) {
+            p *= (ok[k] + 1.0)/(tried[k] + 2.0);
+            e += p;
+        }
+        return e;
+    }
+    double score(int n, int m = 0) const { const double r = R(n, m); return r > 0.0 ? expect(n)/r : 0.0; }
+    int best_active() const {
+        int kb = 0;
+        for (int k = 1; k <= cap; ++k) {
+            if (active[k] && (kb == 0 || score(k) > score(kb))) { kb = k; }
+        }
+        return kb;
+    }
+    // the draft count for the next round
+    int pick() {
+        if (!on) {
+            return cap;
+        }
+        if (blk_left == 0) {
+            if (n_best == 0) {
+                // the next count of the rotation, from the maximum down
+                int k = blk_n;
+                do {
+                    k = k <= 1 ? cap : k - 1;
+                    if (k == cap && blk_n != 0) {
+                        turns++;
+                        const int kb = best_active();
+                        bool done = true;
+                        for (int j = 1; j <= cap; ++j) {
+                            if (!active[j]) { continue; }
+                            if (turns >= 2 && j != kb && score(j) < 0.85*score(kb)) { active[j] = false; continue; }
+                            done = done && nS[j] >= N_CAL;
+                        }
+                        if (done) {
+                            n_best = best_active();
+                            break;
+                        }
+                    }
+                } while (!active[k]);
+                if (n_best == 0) {
+                    blk_n = k;
+                    blk_left = N_BLOCK;
+                }
+            } else {
+                // a finished re-check block: move to the neighbour if it scored 5% better than the choice did just before
+                if (blk_n != n_best && blk_n != 0) {
+                    const int m = nS[blk_n] - blk_from;
+                    if (m > 0 && score(blk_n, m) > 1.05*ref_score) {
+                        n_best = blk_n;
+                        n_switch++;
+                    }
+                    blk_n = 0;
+                }
+                if (rounds - last_check >= N_RECHECK) {
+                    last_check = rounds;
+                    const int d = (rounds/N_RECHECK) % 2 ? 1 : -1;
+                    int k = std::clamp(n_best + d, 1, cap);
+                    if (k == n_best) {
+                        k = std::clamp(n_best - d, 1, cap);
+                    }
+                    if (k != n_best) {
+                        ref_score = score(n_best, 16);
+                        blk_n = k;
+                        blk_from = nS[k];
+                        blk_left = N_BLOCK + 2;
+                    }
+                }
+            }
+        }
+        int n = n_best;
+        if (blk_left > 0) {
+            blk_left--;
+            n = blk_n;
+        }
+        picked[n]++;
+        return n;
+    }
+    // after the verify of a round with n_draft drafts, n_acc of them accepted
+    void observe(int n_draft, int n_acc) {
+        if (!on) {
+            return;
+        }
+        const int64_t now = ggml_time_us();
+        const int64_t dt  = t_last > 0 ? now - t_last : -1;
+        t_last = now;
+        rounds++;
+        for (int k = 1; k <= cap; ++k) {
+            tried[k] *= 0.999; ok[k] *= 0.999;
+        }
+        for (int k = 1; k <= std::min(n_draft, cap); ++k) {
+            if (n_acc >= k - 1) { tried[k] += 1.0; }
+            if (n_acc >= k)     { ok[k]    += 1.0; }
+        }
+        // a round of another request, or one with a prompt in between, is not a decode round
+        if (n_draft < 1 || n_draft > cap || dt <= 0 || dt > 500000) {
+            return;
+        }
+        run_len = n_draft == run_n ? run_len + 1 : 1;
+        run_n   = n_draft;
+        if (run_len > N_SKIP) {
+            win[n_draft][nS[n_draft]++ % N_WIN] = (double) dt;
+        }
+    }
+    // a new request starts: its first round has no previous one to time against
+    void reset_round() { t_last = 0; }
+    ~server_spec_auto() {
+        if (!on || rounds == 0) {
+            return;
+        }
+        fprintf(stderr, "lc-spec-auto: %lld rounds, choice n=%d after %d turns, %lld switches; per draft count n: picked, R(n) ms, E(n) tokens, E/R tok/ms\n",
+            (long long) rounds, n_best, turns, (long long) n_switch);
+        for (int k = 1; k <= cap; ++k) {
+            fprintf(stderr, "lc-spec-auto:   n=%d picked %6lld  R %6.2f  E %5.2f  E/R %.3f\n", k, (long long) picked[k], R(k)/1e3, expect(k),
+                score(k)*1e3);
+        }
+    }
+};
+
 struct server_context_impl {
     friend struct server_context;
 
@@ -1091,6 +1278,7 @@ private:
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
+    server_spec_auto       spec_auto;
 
     bool add_bos_token = true;
 
@@ -1491,6 +1679,12 @@ private:
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+                if (spec) {
+                    spec_auto.init(common_speculative_n_max(spec.get()));
+                    if (spec_auto.on) {
+                        SRV_INF("LLAMA_SPEC_AUTO: the draft count is chosen per round, up to %d\n", spec_auto.cap);
+                    }
+                }
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
                 if (params_base.speculative.has_synth()) {
@@ -1589,6 +1783,23 @@ private:
             SRV_INF("%s", "decision model: prompt cache disabled by default, use `--cache-ram N` to enable it\n");
             params_base.cache_ram_mib    = 0;
             params_base.cache_idle_slots = false;
+        }
+
+        // the prompt cache's states push the model's pages out of the page cache when the model does not fit in the RAM beside
+        // it (pcbox, a 12 GB cgroup: 8.1 tok/s with the default 8 GiB, 56.9 without), so by default it gets only the RAM the
+        // model leaves, less 4 GiB; an explicit --cache-ram wins
+        if (!params_base.cache_ram_explicit && params_base.cache_ram_mib != 0) {
+            const double ram  = (double) llama_moe_ram_limit();
+            const double left = ram - (double) llama_model_size(model_tgt) - 4.0*1073741824.0;
+            const int32_t cap = (int32_t) std::max(0.0, left/1048576.0);
+            if (ram > 0 && (params_base.cache_ram_mib < 0 || cap < params_base.cache_ram_mib)) {
+                SRV_INF("prompt cache limited to %d MiB: %.1f GiB of RAM, %.1f GiB of model (--cache-ram N overrides)\n", cap,
+                    ram/1073741824.0, llama_model_size(model_tgt)/1073741824.0);
+                params_base.cache_ram_mib = cap;
+                if (cap == 0) {
+                    params_base.cache_idle_slots = false;
+                }
+            }
         }
 
         if (params_base.cache_ram_mib != 0) {
@@ -2131,6 +2342,7 @@ private:
         n_empty_consecutive = 0;
 
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
+        spec_auto.reset_round();
         return true;
     }
 
@@ -2735,6 +2947,7 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
+                common_prompt_checkpoint_recycle(*it);
                 it = slot.prompt.checkpoints.erase(it);
                 continue;
             }
@@ -2750,7 +2963,23 @@ private:
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
+            common_prompt_checkpoint_recycle(slot.prompt.checkpoints.front());
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+        }
+
+        // LLAMA_SRV_CKPT_KEEP (default on, =0 off): a checkpoint at the same n_tokens and positions is kept, not copied again.
+        // Checkpoints past a divergence are erased before the prompt is processed, so one that remains holds this prefix's
+        // state; after a restore the server would otherwise copy the state it just restored (112 MiB, ~55 ms here)
+        static const bool keep_same = !getenv("LLAMA_SRV_CKPT_KEEP") || atoi(getenv("LLAMA_SRV_CKPT_KEEP")) != 0;
+        if (keep_same) {
+            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+            for (auto & ck : slot.prompt.checkpoints) {
+                if (ck.n_tokens == n_tokens_new && ck.pos_min == pos_min && ck.pos_max == pos_max && !ck.data_tgt.empty()) {
+                    ck.id_task = id_task;
+                    SLT_TRC(slot, "keeping context checkpoint at n_tokens = %" PRId64 " (same state)\n", ck.n_tokens);
+                    return;
+                }
+            }
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
@@ -2759,6 +2988,7 @@ private:
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
+                    common_prompt_checkpoint_recycle(*it);
                     it = slot.prompt.checkpoints.erase(it);
                 } else {
                     ++it;
@@ -3538,6 +3768,8 @@ private:
     }
 
     void update_slots() {
+        llama_prof_lap("lap.loop_to_update_slots");
+        LC_PROF("srv.update_slots");
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -3581,6 +3813,7 @@ private:
 
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
+            LC_PROF("srv.pre_decode");
             pre_decode();
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
@@ -3636,7 +3869,12 @@ private:
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch.render(off, n_tokens);
-                bool ok = decode(n_batch, off);
+                bool ok;
+                {
+                    LC_PROF("srv.decode_tgt");
+                    ok = decode(n_batch, off);
+                }
+                llama_prof_lap("lap.decode_tgt_rest");
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
 #endif
@@ -3659,7 +3897,9 @@ private:
 
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
+                llama_prof_lap("lap.to_post_decode");
                 post_decode(n_tokens, off);
+                llama_prof_lap("lap.post_decode");
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
@@ -3836,6 +4076,21 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // lc-: with the MoE cache, a ubatch of more than 8 tokens leaves its decode path (cache lookups, CPU hybrid) for the
+        // large-batch one, which streams every expert: with several requests drafting, cap the drafts so that the step's
+        // tokens stay within 8 (2 requests: 3 drafts each, 4: 1). LLAMA_SRV_MOE_BATCH_CAP=<tokens>, 0 = off
+        static const int moe_batch_cap = getenv("LLAMA_SRV_MOE_BATCH_CAP") ? atoi(getenv("LLAMA_SRV_MOE_BATCH_CAP")) : 8;
+        int n_draft_cap = 1 << 30;
+        if (params_base.moe_cache_size > 0 && moe_batch_cap > 0) {
+            int n_gen = 0;
+            for (const auto & sl : slots) {
+                n_gen += sl.state == SLOT_STATE_GENERATING;
+            }
+            if (n_gen > 1) {
+                n_draft_cap = std::max(0, moe_batch_cap/n_gen - 1);
+            }
+        }
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
@@ -3861,7 +4116,10 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                int n_draft_max = std::min(slot.get_n_draft_max(), n_draft_cap);
+                if (spec_auto.on && n_draft_max > 0 && slot.spec_draft.empty()) {
+                    n_draft_max = std::min(n_draft_max, spec_auto.pick());
+                }
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -3910,12 +4168,15 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            llama_prof_lap("lap.to_spec_draft");
+            LC_PROF("srv.spec_draft");
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
         }
 
         // make checkpoints if needed
+        llama_prof_scope lc_prof_ck("srv.ckpt");
         iterate(drafting, [&](server_slot & slot) {
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
@@ -3963,10 +4224,12 @@ private:
             }
         });
 
+        lc_prof_ck.~llama_prof_scope(); new (&lc_prof_ck) llama_prof_scope("srv.batch_gen");
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
             slot.handle_last_sampled_token(batch);
         });
+        lc_prof_ck.~llama_prof_scope(); new (&lc_prof_ck) llama_prof_scope("srv.prompts");
 
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
@@ -4304,6 +4567,7 @@ private:
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                        common_prompt_checkpoint_recycle(*it);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
@@ -4500,7 +4764,10 @@ private:
                         slot.prompt.tokens.push_back(cur_tok);
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                        // LLAMA_SRV_USER_BREAK=0: not at user messages (the checkpoints before the prompt's end remain). With host
+                        // experts each prompt batch above 32 tokens uploads most experts, so a turn's two batches cost two uploads
+                        static const bool user_break = !getenv("LLAMA_SRV_USER_BREAK") || atoi(getenv("LLAMA_SRV_USER_BREAK")) != 0;
+                        if (do_checkpoint && user_break && spans.is_user_start(slot.prompt.n_tokens())) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
@@ -4686,6 +4953,45 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        // tandem.cpp LLAMA_MOE_SHADOW=1 (slipstream, for models read from the SSD): a small decode batch of one sequence runs
+        // first as a shadow pass that never waits for the SSD (llama_moe_shadow), which starts the reads of the experts it
+        // left out; then its recurrent state is restored from a copy on the device (the snapshots for drafts reach back only
+        // to after the first token of a batch), its KV cells removed, and the batch runs for real
+        static const bool moe_shadow_on = getenv("LLAMA_MOE_SHADOW") && atoi(getenv("LLAMA_MOE_SHADOW")) != 0;
+        static std::vector<uint8_t> moe_shadow_state;
+        // timing of shadow rounds (logged every 256): state save + shadow decode, restore + rollback, the real decode
+        static int64_t moe_shadow_t0 = 0, moe_shadow_t1 = 0, moe_shadow_t2 = 0;
+        static double  moe_shadow_us[3] = {0, 0, 0};
+        static int     moe_shadow_n = 0;
+        moe_shadow_t0 = 0;
+        if (moe_shadow_on && batch.view.size() <= 8 && !batch.has_embd()) {
+            const llama_seq_id seq = batch.tokens[off].id_slot; // a slot's sequence id is its id
+            llama_pos pos0 = batch.tokens[off].pos[0];
+            bool one_seq = true;
+            for (int i = off; i < off + batch.view.size(); ++i) {
+                one_seq &= batch.tokens[i].id_slot == seq;
+                pos0 = std::min(pos0, batch.tokens[i].pos[0]);
+            }
+            const llama_state_seq_flags sflags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+            if (one_seq && llama_moe_shadow(ctx_tgt, true)) {
+                moe_shadow_t0 = ggml_time_us();
+                moe_shadow_state.resize(llama_state_seq_get_size_ext(ctx_tgt, seq, sflags));
+                llama_state_seq_get_data_ext(ctx_tgt, moe_shadow_state.data(), moe_shadow_state.size(), seq, sflags);
+                int ret_s = 0;
+                queue_tasks.yield_to_queue([&]() {
+                    ret_s = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+                    llama_synchronize(ctx_tgt);
+                });
+                moe_shadow_t1 = ggml_time_us();
+                llama_moe_shadow(ctx_tgt, false);
+                const bool restored = llama_state_seq_set_data_ext(ctx_tgt, moe_shadow_state.data(), moe_shadow_state.size(), seq, sflags) > 0;
+                if (ret_s != 0 || !restored || !llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq, pos0, -1)) {
+                    GGML_ABORT("shadow pass: decode %d, state restore %d or rollback from %d failed", ret_s, (int) restored, pos0);
+                }
+                moe_shadow_t2 = ggml_time_us();
+            }
+        }
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
@@ -4695,6 +5001,15 @@ private:
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (moe_shadow_t0 != 0) {
+            moe_shadow_us[0] += moe_shadow_t1 - moe_shadow_t0;
+            moe_shadow_us[1] += moe_shadow_t2 - moe_shadow_t1;
+            moe_shadow_us[2] += ggml_time_us() - moe_shadow_t2;
+            if (++moe_shadow_n % 256 == 0) {
+                SRV_INF("shadow rounds: %d, per round %.1f ms shadow, %.1f ms restore, %.1f ms real (%zu bytes of state)\n", moe_shadow_n,
+                    moe_shadow_us[0]/moe_shadow_n/1e3, moe_shadow_us[1]/moe_shadow_n/1e3, moe_shadow_us[2]/moe_shadow_n/1e3, moe_shadow_state.size());
+            }
+        }
 
         if (ret != 0) {
             {
@@ -4754,9 +5069,12 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            llama_prof_lap("lap.to_spec_process");
+            LC_PROF("srv.spec_process");
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch.view);
             });
+            llama_prof_lap("lap.spec_process");
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -4795,6 +5113,7 @@ private:
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off) {
+        LC_PROF("srv.post_decode");
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
@@ -4931,6 +5250,7 @@ private:
 
             // verify and try to accept the draft
             {
+                LC_PROF("srv.verify_accept");
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
@@ -5014,6 +5334,7 @@ private:
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
             slot.stats.n_draft_verif_steps += 1;
+            spec_auto.observe((int) n_draft, (int) n_accepted);
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;
             if (n_accepted_per_pos.empty()) {
@@ -5030,8 +5351,12 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            {
+                LC_PROF("srv.seq_rm");
+                slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            }
 
+            llama_prof_scope lc_prof_pt("srv.process_tokens");
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
 

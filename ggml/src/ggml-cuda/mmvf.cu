@@ -805,6 +805,17 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
         }
     }
 
+    // GGML_CUDA_MMVF_MAX=N: use the vector kernel up to batch N for float weights (small batches such as speculative
+    // verify windows, where the tile kernel loses on small matrices)
+    static const int mmvf_max = [] {
+        const char * env = getenv("GGML_CUDA_MMVF_MAX");
+        return env != nullptr ? atoi(env) : 0;
+    }();
+    if (mmvf_max > 0 && ne11 <= std::min(mmvf_max, MMVF_MAX_BATCH_SIZE) &&
+        (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16)) {
+        return true;
+    }
+
     switch (type) {
         case GGML_TYPE_F32:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {

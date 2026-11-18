@@ -363,19 +363,26 @@ llama_model_qwen4exp::graph::build_hc_mix(
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     cb(xn, "hc_norm", il);
 
+    static const bool hc_fuse = getenv("LLAMA_HC_FUSE") != nullptr && atoi(getenv("LLAMA_HC_FUSE")) != 0;
     ggml_tensor * lo = nullptr;
     ggml_tensor * inject = nullptr;
+    float inject_scale = 1.0f;
     if (w_down_inject) {
         // one matmul for both: the hc_down rows, then the hc_inject rows
         const int64_t n_lo = w_down_inject->ne[1] - hc;
         ggml_tensor * lo_inject = build_lora_mm(w_down_inject, xn);
         // scale the combined rows before the split; both lo and inject use 1/hc
-        lo_inject = ggml_scale(ctx0, lo_inject, 1.0f / (float) hc);
+        if (!model.hc_scale_folded.count(w_down_inject)) {
+            lo_inject = ggml_scale(ctx0, lo_inject, 1.0f / (float) hc);
+        }
         lo     = ggml_view_2d(ctx0, lo_inject, n_lo, nt, lo_inject->nb[1], 0);
         inject = ggml_view_2d(ctx0, lo_inject, hc, nt, lo_inject->nb[1], ggml_row_size(lo_inject->type, n_lo));
         cb(inject, "hc_inject", il);
     } else {
-        lo = ggml_scale(ctx0, build_lora_mm(w_down, xn), 1.0f / (float) hc);
+        lo = build_lora_mm(w_down, xn);
+        if (!model.hc_scale_folded.count(w_down)) { // LLAMA_HC_FUSE: else the 1/hc scale is in the weights
+            lo = ggml_scale(ctx0, lo, 1.0f / (float) hc);
+        }
     }
     lo = ggml_silu(ctx0, lo);
     ggml_tensor * gate = build_lora_mm(w_up, lo);
@@ -407,21 +414,45 @@ llama_model_qwen4exp::graph::build_hc_mix(
     cb(mixed, "hc_mixed", il);
 
     if (!w_down_inject && w_inject) {
-        inject = ggml_scale(ctx0, build_lora_mm(w_inject, xn), 1.0f / (float) hc);
+        inject = build_lora_mm(w_inject, xn);
         cb(inject, "hc_inject", il);
+        if (hc_fuse) {
+            // the hc combine applies the 1/hc scale itself; put the inject projection right after the mix in the node
+            // order, so the CUDA hc mix fusion can compute it with the down projection (it reads the same normed input)
+            inject_scale = 1.0f / (float) hc;
+            ggml_build_forward_expand(gf, mixed);
+            ggml_build_forward_expand(gf, inject);
+        } else {
+            inject = ggml_scale(ctx0, inject, 1.0f / (float) hc);
+        }
     }
 
-    return { mixed, inject };
+    return { mixed, inject, inject_scale };
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
-        ggml_tensor * residual,
-        ggml_tensor * block_out,
-        ggml_tensor * inject,
-        int           il) {
+        ggml_tensor *  residual,
+        ggml_tensor *  block_out,
+        const hc_mix & mix,
+        int            il) {
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = residual->ne[2];
 
+    ggml_tensor * inject = mix.inject;
+    static const bool hc_fuse = getenv("LLAMA_HC_FUSE") != nullptr && atoi(getenv("LLAMA_HC_FUSE")) != 0;
+    if (hc_fuse && cparams.fused_dsv4_hc_post && il >= 0) {
+        // LLAMA_HC_FUSE: the op takes the injection logits and applies 2*sigmoid(x*inject_scale) itself
+        ggml_tensor * cur = ggml_dsv4_hc_post_sig(ctx0, block_out, residual, inject, nullptr, mix.inject_scale, 2.0f,
+                shexp_pend, shexp_gate_pend);
+        shexp_pend = shexp_gate_pend = nullptr;
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_POST, cur, il});
+        cb(cur, "hc_combine", il);
+        return cur;
+    }
+
+    if (mix.inject_scale != 1.0f) {
+        inject = ggml_scale(ctx0, inject, mix.inject_scale);
+    }
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
     ggml_tensor * w = ggml_sigmoid(ctx0, inject);
     w = ggml_scale(ctx0, w, 2.0f);
@@ -532,7 +563,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
         }
 
-        res_hc = build_hc_combine(res_hc, cur, attn_mix.inject, il);
+        res_hc = build_hc_combine(res_hc, cur, attn_mix, il);
 
         hc_mix ffn_mix = build_hc_mix(res_hc,
                 model.layers[il].hc_ffn_norm,
@@ -546,7 +577,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         cur = build_layer_ffn(cur, il);
         cb(cur, "ffn_out", il);
 
-        res_hc = build_hc_combine(res_hc, cur, ffn_mix.inject, il);
+        res_hc = build_hc_combine(res_hc, cur, ffn_mix, il);
 
         // "l_last" is the layer output name that build_cvec and imatrix look for
         cb(res_hc, "l_last", il);
@@ -606,15 +637,29 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_set_input(inp->h);
     ggml_set_name(inp->h, "mtp_h_input");
 
+    // LLAMA_MTP_CHAIN: a 1-token step reads its token and h from the chain buffers (see llama_mtp_chain_*); the host
+    // inputs stay in the graph (set_input mirrors them into the buffers unless a chain is active)
+    const bool chain = model.mtp_chain_tok != nullptr && n_tokens == 1 && n_outputs == 1 && ubatch.token;
+    // any step with one output also writes the buffers, so the first draft step (the deferred catch-up plus the
+    // last token) can start a chain without a host round trip
+    const bool chain_write = model.mtp_chain_tok != nullptr && n_outputs == 1;
+
     ggml_tensor * tok_embd;
-    if (ubatch.token) {
+    if (chain) {
+        tok_embd = ggml_get_rows(ctx0, model.tok_embd, model.mtp_chain_tok);
+        ggml_build_forward_expand(gf, inp->tokens);
+        ggml_build_forward_expand(gf, inp->h);
+        inp->chain_tok    = model.mtp_chain_tok;
+        inp->chain_h      = model.mtp_chain_h;
+        inp->chain_active = &model.mtp_chain_active;
+    } else if (ubatch.token) {
         tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
     } else {
         tok_embd = inp->embd;
     }
     cb(tok_embd, "mtp_tok_embd", il);
 
-    ggml_tensor * h = inp->h;
+    ggml_tensor * h = chain ? ggml_reshape_2d(ctx0, model.mtp_chain_h, hparams.n_embd_out(), 1) : inp->h;
 
     res->add_input(std::move(inp));
 
@@ -647,12 +692,12 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     hc_mix attn_mix = build_hc_mix(res_hc, layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject, layer.hc_attn_down_inject, il);
     ggml_tensor * cur    = attn_mix.cur;
     cur    = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
-    res_hc = build_hc_combine(res_hc, cur, attn_mix.inject, il);
+    res_hc = build_hc_combine(res_hc, cur, attn_mix, il);
 
     hc_mix ffn_mix = build_hc_mix(res_hc, layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject, layer.hc_ffn_down_inject, il);
     cur    = ffn_mix.cur;
     cur    = build_layer_ffn(cur, il);
-    res_hc = build_hc_combine(res_hc, cur, ffn_mix.inject, il);
+    res_hc = build_hc_combine(res_hc, cur, ffn_mix, il);
 
     // the next draft step reads this residual as its h
     ggml_tensor * flat     = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, n_tokens);
@@ -668,9 +713,24 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    if (model.output_draft) {
+        // score the subset only, then scatter into full-width logits that are -inf elsewhere (the drafter takes the argmax)
+        ggml_tensor * sub = ggml_mul_mat(ctx0, model.output_draft, cur);                          // [n_sub, n_out]
+        ggml_tensor * full = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, sub->ne[1], model.output->ne[1]), -INFINITY);
+        full = ggml_set_rows(ctx0, full, ggml_cont(ctx0, ggml_transpose(ctx0, sub)), model.output_draft_ids); // [n_out, n_vocab]
+        cur = ggml_cont(ctx0, ggml_transpose(ctx0, full));                                        // [n_vocab, n_out]
+    } else {
+        cur = build_lora_mm(model.output, cur, model.output_s);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
+
+    if (chain_write) {
+        // the next chained step reads the greedy token and this step's h; written last, after every read
+        ggml_tensor * tok = ggml_argmax(ctx0, cur);                                                   // I32 [1]
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tok, model.mtp_chain_tok));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_reshape_1d(ctx0, flat_out, ggml_nelements(flat_out)), model.mtp_chain_h));
+    }
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
@@ -1126,11 +1186,42 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
+    // LLAMA_GDN_DIRECT: the fused GDN op reads the ubatch state straight from the cache by row index,
+    // which drops the per-layer gather of the whole state (single-sequence ubatches, fused op only)
+    static const bool gdn_direct = getenv("LLAMA_GDN_DIRECT") && atoi(getenv("LLAMA_GDN_DIRECT")) != 0;
+    const bool gdn_fused = cparams.n_rs_seq > 0 || (n_seq_tokens == 1 ? cparams.fused_gdn_ar : cparams.fused_gdn_ch);
+
     ggml_tensor * beta  = nullptr;
     ggml_tensor * alpha = nullptr;
-    if (model.layers[il].ssm_beta_alpha_cat) {
+    ggml_tensor * gate  = nullptr;
+    gdn_gate_dt = nullptr;
+    gdn_gate_a  = nullptr;
+    // [beta | alpha] in one weight: merged by the converter, or at load (LLAMA_GDN_GATES)
+    ggml_tensor * ba_w = model.layers[il].ssm_beta_alpha_cat ? model.layers[il].ssm_beta_alpha_cat : model.layers[il].ssm_ba_cat;
+    // up to 8 tokens (decode and verify), where float weights take the vector kernel; larger batches would go to
+    // GEMM kernels whose results depend on the row count
+    if (ba_w && gdn_fused && n_seq_tokens * n_seqs <= 8 &&
+            model.layers[il].ssm_dt->type == GGML_TYPE_F32 && model.layers[il].ssm_a->type == GGML_TYPE_F32) {
+        // LLAMA_GDN_GATES: one matvec for beta and alpha; the fused op applies the bias, softplus, A and sigmoid
+        static const int gates_mode = atoi(getenv("LLAMA_GDN_GATES"));
+        if (gates_mode == 2 && model.layers[il].ssm_beta && model.layers[il].ssm_alpha) {
+            // diagnostic: the two separate matvecs, activations in the fused op
+            beta = ggml_reshape_4d(ctx0, build_lora_mm(model.layers[il].ssm_beta, cur), 1, num_v_heads, n_seq_tokens, n_seqs);
+            gate = ggml_reshape_4d(ctx0, build_lora_mm(model.layers[il].ssm_alpha, cur), 1, num_v_heads, n_seq_tokens, n_seqs);
+        } else {
+        ggml_tensor * ba = build_lora_mm(ba_w, cur); // [2*H, n_tokens]
+        cb(ba, "beta_alpha_raw", il);
+        beta = ggml_view_4d(ctx0, ba, 1, num_v_heads, n_seq_tokens, n_seqs,
+                ggml_row_size(ba->type, 1), ba->nb[1], ba->nb[1]*n_seq_tokens, 0);
+        gate = ggml_view_4d(ctx0, ba, 1, num_v_heads, n_seq_tokens, n_seqs,
+                ggml_row_size(ba->type, 1), ba->nb[1], ba->nb[1]*n_seq_tokens, ggml_row_size(ba->type, num_v_heads));
+        }
+        gdn_gate_dt = model.layers[il].ssm_dt;
+        gdn_gate_a  = model.layers[il].ssm_a;
+    } else {
+    if (ba_w) {
         // beta and alpha read the same input: one matmul, then the beta rows and the alpha rows
-        ggml_tensor * ba = build_lora_mm(model.layers[il].ssm_beta_alpha_cat, cur);
+        ggml_tensor * ba = build_lora_mm(ba_w, cur);
         cb(ba, "beta_alpha", il);
 
         beta  = ggml_view_4d(ctx0, ba, 1, num_v_heads, n_seq_tokens, n_seqs,
@@ -1154,10 +1245,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
     cb(alpha_softplus, "a_softplus", il);
 
-    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
+    gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
     cb(gate, "gate", il);
 
     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
+    }
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
@@ -1171,8 +1263,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
             conv_kernel_size - 1, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    ggml_tensor * state = nullptr;
+    gdn_state_ids = nullptr;
+    // LLAMA_GDN_REPLAY keeps one S plane: only the direct state read of the fused op (unrepeated k heads) knows it
+    if (mctx_cur->get_replay() && !(gdn_direct && gdn_fused && n_seqs == 1 && cparams.fused_gdn_ar && cparams.fused_gdn_ch)) {
+        GGML_ABORT("LLAMA_GDN_REPLAY needs the fused gated delta net op on this device: run with LLAMA_GDN_REPLAY=0");
+    }
+    if (gdn_direct && gdn_fused && n_seqs == 1) {
+        ggml_tensor * state_ids = nullptr;
+        auto get_state_rows = [&](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) {
+            state     = ggml_reshape_4d(ctx, states, head_v_dim, head_v_dim, num_v_heads, states->ne[1]);
+            state_ids = ids;
+            return state;
+        };
+        build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs, get_state_rows);
+        gdn_state_ids = state_ids;
+    } else {
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    }
     cb(state, "state_predelta", il);
 
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
@@ -1226,6 +1335,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cb(v_conv, "v_conv_predelta", il);
 
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+    gdn_state_ids = nullptr;
+    gdn_gate_dt   = nullptr;
+    gdn_gate_a    = nullptr;
 
     ggml_tensor * z_2d = ggml_view_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs,
             ggml_row_size(z->type, head_v_dim), z->nb[1], z->nb[1] * n_seq_tokens, 0);
@@ -1276,6 +1388,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
         // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token)
         ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
         cb(shared_gate, "shared_expert_gate", il);
+
+        static const bool hc_fuse = getenv("LLAMA_HC_FUSE") != nullptr && atoi(getenv("LLAMA_HC_FUSE")) != 0;
+        if (hc_fuse && cparams.fused_dsv4_hc_post && il >= 0) {
+            // LLAMA_HC_FUSE: the next hc combine adds ffn_shexp * sigmoid(shared_gate) itself
+            GGML_ASSERT(shexp_pend == nullptr);
+            shexp_pend      = ffn_shexp;
+            shexp_gate_pend = shared_gate;
+            return moe_out;
+        }
 
         shared_gate = ggml_sigmoid(ctx0, shared_gate);
         cb(shared_gate, "shared_expert_gate_sigmoid", il);
@@ -1421,7 +1542,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     ggml_tensor * state = ggml_reshape_3d(ctx0, rows, state_cols, channels, n_seqs);
     cb(state, "conv_state_at", il);
 
-    ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
+    // LLAMA_CONV_CONT=1: with more than one token the transposed input is strided and the concat takes its slow
+    // non-contiguous path (~7 us per layer at 5 tokens); a contiguous copy first is cheaper. Same values
+    static const bool conv_cont = getenv("LLAMA_CONV_CONT") && atoi(getenv("LLAMA_CONV_CONT")) != 0;
+    ggml_tensor * xt = ggml_transpose(ctx0, x);
+    if (conv_cont && x->ne[1] > 1) {
+        xt = ggml_cont(ctx0, xt);
+    }
+    ggml_tensor * conv_input = ggml_concat(ctx0, state, xt, 0);
 
     // [TAG_RECURRENT_ROLLBACK_SPLITS] keep the last state_cols columns once per rollback slot,
     // slot s ending s tokens earlier so a rollback of s tokens reads a history that never saw them
@@ -1429,6 +1557,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     const uint32_t mem_size = mctx_cur->get_size();
 
     const int64_t n_slots = (int64_t) cparams.n_rs_seq + 1;
+
+    // LLAMA_CONV_TAIL=1: copy each strided tail straight into its slot (one copy kernel) instead of a contiguous copy
+    // first, which CUDA runs as a slow 2D memcpy of 12-byte rows (~6 us each, 5 slots per linear layer). Same values
+    static const bool conv_tail = getenv("LLAMA_CONV_TAIL") && atoi(getenv("LLAMA_CONV_TAIL")) != 0;
 
     for (int64_t slot = 0; slot < n_slots; ++slot) {
         const int64_t s_idx = std::max<int64_t>(0, conv_input->ne[0] - state_cols - slot);
@@ -1443,7 +1575,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                 conv_states_all->nb[1],
                 (slot * mem_size + kv_head) * row_size);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        if (conv_tail) {
+            ggml_tensor * dst3 = ggml_view_3d(ctx0, conv_states_all,
+                    state_cols, channels, n_seqs,
+                    ggml_row_size(conv_states_all->type, state_cols), conv_states_all->nb[1],
+                    (slot * mem_size + kv_head) * row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail, dst3));
+        } else {
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        }
     }
 
     return conv_input;
@@ -1462,7 +1602,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     res->add_input(std::move(ple_inp));
 
     // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    ggml_tensor * emb = nullptr;
+    if (model.ple_host_mapped && ggml_backend_sched_get_n_backends(sched) > 1) {
+        // LLAMA_PLE_GPU: the GPU gathers the rows from the registered host table (see load_tensors_ple_gpu)
+        emb = ggml_get_rows_host(ctx0, model.per_layer_tok_embd, rows);
+        ggml_backend_sched_set_tensor_backend(sched, emb, ggml_backend_sched_get_backend(sched, 0));
+    } else {
+        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    }
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 

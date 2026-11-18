@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-moe-cache.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -25,13 +26,21 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 
+#ifdef __linux__
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cerrno>
 #include <cstring>
 #include <cmath>
+#include <fstream>
 #include <functional>
+#include <thread>
 #include <map>
 #include <numeric>
 #include <regex>
@@ -1905,7 +1914,28 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // the mappings ask the kernel to read the whole model ahead (MADV_WILLNEED). On a box with less RAM than the model that
+    // reads it all at load only to push most of it out again (DS4.1 IQ2_XS on 64 GB: ~145 GB, ~100 s), and leaves the page
+    // cache holding the file's last part instead of the hot experts. So only when the eagerly mapped part fits in 80% of the
+    // RAM (LLAMA_MOE_PREFETCH=0/1 forces it); the hot experts can be read in instead (LLAMA_MOE_HOT_LIST)
+    bool prefetch = true;
+    {
+        size_t eager = 0;
+        for (const auto & [name, t] : tensors_by_name) {
+            if (!ml.lazy.has(t)) {
+                eager += ggml_nbytes(t);
+            }
+        }
+        const size_t ram = llama_moe_ram_limit();
+        if (const char * e = getenv("LLAMA_MOE_PREFETCH")) {
+            prefetch = atoi(e) != 0;
+        } else if (ram > 0 && (double) eager > 0.8*(double) ram) {
+            prefetch = false;
+            LLAMA_LOG_INFO("%s: no read-ahead of the model: %.1f GiB mapped eagerly > 80%% of %.1f GiB of RAM\n", __func__,
+                eager/1073741824.0, ram/1073741824.0);
+        }
+    }
+    ml.init_mappings(prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -2063,8 +2093,472 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+    load_tensors_draft_vocab();
+    load_tensors_hc_fold();
+    load_tensors_gdn_gates();
+    load_tensors_mtp_chain();
+    load_tensors_ple_gpu();
+    load_tensors_exps_pin();
 
     return true;
+}
+
+// the CUDA backend, named ROCm in a HIP build: it registers host memory for both
+static ggml_backend_reg_t llama_cuda_reg() {
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+    return reg ? reg : ggml_backend_reg_by_name("ROCm");
+}
+
+#ifdef __linux__
+// bytes of free memory in blocks of 2 MiB or more (/proc/buddyinfo, orders >= 9 of 4 KiB pages), 0 if unknown or with
+// LLAMA_MOE_PIN_HUGE=0 (4 KiB pages). MADV_HUGEPAGE asks for 3/4 of it: a huge page fault beyond what is free compacts and
+// reclaims in the faulting thread. Huge pages gave the CPU tier 21.5 -> 25.5 GB/s on pcbox (kernel 6.8); on pcbox1 (kernel 7.0)
+// they turned the thrash of a second load (see load_tensors_exps_pin) into a loop in reclaim, fixed by the page-out there
+static size_t llama_free_huge_bytes() {
+    if (getenv("LLAMA_MOE_PIN_HUGE") != nullptr && atoi(getenv("LLAMA_MOE_PIN_HUGE")) == 0) {
+        return 0;
+    }
+    std::ifstream f("/proc/buddyinfo");
+    std::string line;
+    size_t n2m = 0;
+    while (std::getline(f, line)) {
+        std::istringstream ss(line.substr(std::min(line.size(), line.find("zone") + 4)));
+        std::string zone;
+        ss >> zone;
+        size_t cnt;
+        for (int order = 0; ss >> cnt; ++order) {
+            if (order >= 9) {
+                n2m += cnt << (order - 9);
+            }
+        }
+    }
+    return n2m*2*1024*1024;
+}
+
+// bytes of an n-byte anonymous copy to ask huge pages for: all of it when MemAvailable leaves 8 GiB beside it (the kernel
+// then reclaims clean page cache and compacts for the faults: after a DeepSeek run filled the cache, the free 2 MiB blocks
+// gave 0.12 of 46.8 GiB in huge pages and the cfl1 ROCm uploads ran 30% slower), else 3/4 of the free 2 MiB blocks
+static size_t llama_huge_request(size_t n) {
+    const size_t free_huge = llama_free_huge_bytes();
+    if (getenv("LLAMA_MOE_PIN_HUGE") != nullptr && atoi(getenv("LLAMA_MOE_PIN_HUGE")) == 0) {
+        return 0;
+    }
+    std::ifstream f("/proc/meminfo");
+    std::string key;
+    size_t kb = 0, avail = 0;
+    while (f >> key >> kb) {
+        if (key == "MemAvailable:") {
+            avail = kb*1024;
+            break;
+        }
+        f.ignore(64, '\n');
+    }
+    if (avail >= n + ((size_t) 8 << 30)) {
+        return n;
+    }
+    return std::min(n, free_huge/4*3);
+}
+#endif
+
+void llama_model_base::load_tensors_ple_gpu() {
+    if (getenv("LLAMA_PLE_GPU") == nullptr || atoi(getenv("LLAMA_PLE_GPU")) == 0 || per_layer_tok_embd == nullptr ||
+            per_layer_tok_embd->buffer == nullptr || !ggml_backend_buffer_is_host(per_layer_tok_embd->buffer) ||
+            per_layer_tok_embd->data == nullptr) {
+        return;
+    }
+    // a CUDA host buffer (e.g. -lm none) is pinned and mapped already
+    if (strcmp(ggml_backend_buffer_name(per_layer_tok_embd->buffer), "CUDA_Host") == 0 ||
+            strcmp(ggml_backend_buffer_name(per_layer_tok_embd->buffer), "ROCm_Host") == 0) {
+        ple_host_mapped = true;
+        LLAMA_LOG_INFO("%s: LLAMA_PLE_GPU: '%s' is in CUDA_Host memory, the GPU gathers its rows\n", __func__, per_layer_tok_embd->name);
+        return;
+    }
+    ggml_backend_reg_t reg = llama_cuda_reg();
+    auto reg_fn = reg ? (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer") : nullptr;
+    if (reg_fn == nullptr) {
+        LLAMA_LOG_WARN("%s: LLAMA_PLE_GPU: no CUDA host registration, the table stays on the CPU path\n", __func__);
+        return;
+    }
+    // registering the mapped table pins its file pages as much as a copy would: the same RAM rule as the copy below, first. ROCm
+    // registers the mapping (cfl1, kernel 7.0: 26.8 GiB in 110 s, then the pinned experts on top, ~60 of 62 GiB pinned); CUDA
+    // refuses it on kernel 7.0
+    {
+        const char * copy_env = getenv("LLAMA_PLE_GPU_COPY");
+        const double ram  = (double) llama_moe_ram_limit();
+        const double need = (double) size() + 8.0*1073741824.0;
+        if (ram > 0 && ram < need && (copy_env == nullptr || atoi(copy_env) == 0)) {
+            LLAMA_LOG_INFO("%s: LLAMA_PLE_GPU: not registered, %.1f GiB of RAM < %.1f GiB (the model + 8 GiB), the table stays on the "
+                "CPU path (LLAMA_PLE_GPU_COPY=1 forces it)\n", __func__, ram/1073741824.0, need/1073741824.0);
+            return;
+        }
+    }
+    // ggml-cuda registers host memory only with GGML_CUDA_REGISTER_HOST set (read once, at its first use; nothing else here uses it)
+    setenv("GGML_CUDA_REGISTER_HOST", "1", 0);
+    // whole pages around the table (inside the same mapping or allocation)
+    const size_t page = 4096;
+    const uintptr_t b = (uintptr_t) per_layer_tok_embd->data & ~(uintptr_t) (page - 1);
+    const uintptr_t e = ((uintptr_t) per_layer_tok_embd->data + ggml_nbytes(per_layer_tok_embd) + page - 1) & ~(uintptr_t) (page - 1);
+    const int64_t t0 = ggml_time_us();
+    ple_host_mapped = reg_fn((void *) b, e - b);
+    LLAMA_LOG_INFO("%s: LLAMA_PLE_GPU: %s %.2f GiB of '%s' (%s) in %.1f s\n", __func__, ple_host_mapped ? "registered" : "FAILED to register",
+        (e - b)/1073741824.0, per_layer_tok_embd->name, ggml_backend_buffer_name(per_layer_tok_embd->buffer), (ggml_time_us() - t0)/1e6);
+#ifdef __linux__
+    // file-backed pages cannot be pinned on newer kernels: register an anonymous copy (LLAMA_PLE_GPU_COPY=0 keeps the CPU path,
+    // =1 forces the copy). By default only when the RAM holds the whole model beside it: the pinned copy cannot be evicted, so on a
+    // smaller host the mmapped experts fall out of the page cache and are read from the disk again (64 GB host: 74 -> 27 tok/s)
+    const char * copy_env = getenv("LLAMA_PLE_GPU_COPY");
+    bool copy = copy_env == nullptr || atoi(copy_env) != 0;
+    if (!ple_host_mapped && copy && copy_env == nullptr) {
+        const double ram = (double) llama_moe_ram_limit();
+        const double need = (double) size() + 8.0*1073741824.0;
+        if (ram > 0 && ram < need) {
+            copy = false;
+            LLAMA_LOG_INFO("%s: LLAMA_PLE_GPU: no anonymous copy, %.1f GiB of RAM < %.1f GiB (the model + 8 GiB), the table stays on the "
+                "CPU path (LLAMA_PLE_GPU_COPY=1 forces it)\n", __func__, ram/1073741824.0, need/1073741824.0);
+        }
+    }
+    if (!ple_host_mapped && copy) {
+        auto unreg_fn = (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer");
+        const size_t n = ggml_nbytes(per_layer_tok_embd);
+        const size_t na = (n + page - 1) & ~(page - 1);
+        const int64_t t1 = ggml_time_us();
+        void * dst = mmap(nullptr, na, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (dst == MAP_FAILED || unreg_fn == nullptr) {
+            LLAMA_LOG_WARN("%s: LLAMA_PLE_GPU: no anonymous copy (%s), the table stays on the CPU path\n", __func__,
+                dst == MAP_FAILED ? strerror(errno) : "no unregister function");
+            if (dst != MAP_FAILED) { munmap(dst, na); }
+            return;
+        }
+        const size_t huge = llama_huge_request(na);
+        if (huge > 0) {
+            madvise(dst, huge, MADV_HUGEPAGE);
+        }
+        const int nt = std::max(1, std::min(16, (int) std::thread::hardware_concurrency()));
+        std::vector<std::thread> th;
+        const size_t chunk = ((n + nt - 1)/nt + page - 1) & ~(page - 1);
+        for (int i = 0; i < nt; ++i) {
+            const size_t o = i*chunk;
+            if (o >= n) { break; }
+            th.emplace_back([=]() { memcpy((char *) dst + o, (const char *) per_layer_tok_embd->data + o, std::min(chunk, n - o)); });
+        }
+        for (auto & t : th) { t.join(); }
+        if (!reg_fn(dst, na)) {
+            LLAMA_LOG_WARN("%s: LLAMA_PLE_GPU: FAILED to register the anonymous copy, the table stays on the CPU path\n", __func__);
+            munmap(dst, na);
+            return;
+        }
+        per_layer_tok_embd->data = dst;
+        ple_host_copy = std::shared_ptr<void>(dst, [na, unreg_fn](void * q) { unreg_fn(q); munmap(q, na); });
+        ple_host_mapped = true;
+        // the mapped file pages are no longer read: let the page cache drop them
+        madvise((void *) b, e - b, MADV_DONTNEED);
+        LLAMA_LOG_INFO("%s: LLAMA_PLE_GPU: copied %.2f GiB of '%s' to anonymous memory and registered it in %.1f s\n", __func__,
+            na/1073741824.0, per_layer_tok_embd->name, (ggml_time_us() - t1)/1e6);
+    }
+#endif
+}
+
+// mmap mode: the routed experts in mapped host memory are copied once into one anonymous allocation (huge pages) and
+// registered with CUDA, so the MoE cache uploads them from pinned memory, while the rest (e.g. Qwen3.8's 27 GiB per-layer
+// embedding table) stays mapped. On by default when the RAM holds the experts + 10 GiB (Qwen3.8 IQ3_S, 64 GB host, RTX 4090:
+// 81.2 -> 93.6 tok/s); LLAMA_MOE_PIN_EXPS=0 keeps them mapped.
+void llama_model_base::load_tensors_exps_pin() {
+#ifdef __linux__
+    if (getenv("LLAMA_MOE_PIN_EXPS") != nullptr && atoi(getenv("LLAMA_MOE_PIN_EXPS")) == 0) {
+        return;
+    }
+    std::vector<ggml_tensor *> ts;
+    size_t total = 0;
+    const size_t page = 4096;
+    for (const auto & [name, t] : tensors_by_name) {
+        if (name.find("_exps.weight") == std::string::npos || t->buffer == nullptr || t->data == nullptr ||
+                strcmp(ggml_backend_buffer_name(t->buffer), "CPU_Mapped") != 0) {
+            continue;
+        }
+        ts.push_back(t);
+        total += (ggml_nbytes(t) + page - 1) & ~(page - 1);
+    }
+    if (ts.empty()) {
+        return;
+    }
+    const double ram = (double) llama_moe_ram_limit();
+    if (ram > 0 && ram < (double) total + 10.0*1073741824.0) {
+        LLAMA_LOG_INFO("%s: LLAMA_MOE_PIN_EXPS: %.1f GiB of RAM < %.1f GiB of mapped experts + 10 GiB, they stay mapped\n", __func__,
+            ram/1073741824.0, total/1073741824.0);
+        return;
+    }
+    ggml_backend_reg_t reg = llama_cuda_reg();
+    auto reg_fn   = reg ? (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer") : nullptr;
+    auto unreg_fn = reg ? (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer") : nullptr;
+    if (reg_fn == nullptr || unreg_fn == nullptr) {
+        LLAMA_LOG_WARN("%s: LLAMA_MOE_PIN_EXPS: no CUDA host registration, the experts stay mapped\n", __func__);
+        return;
+    }
+    setenv("GGML_CUDA_REGISTER_HOST", "1", 0);
+    const int64_t t0 = ggml_time_us();
+#ifdef MADV_PAGEOUT
+    // drop this model's cached file pages first, as on the first load after a boot: on a host where the copy and the mapped
+    // rest (Qwen3.8's 27 GiB per-layer table) just fit, a table still hot from the previous run kept its pages while the copy's
+    // own reads were evicted before use (pcbox1, kernel 7.0, MGLRU: the second load of a boot took 3m49s instead of 21 s, and
+    // looped in reclaim with huge pages). The table comes back from the file as it is used
+    for (const auto & [name, t] : tensors_by_name) {
+        if (t->buffer != nullptr && t->data != nullptr && strcmp(ggml_backend_buffer_name(t->buffer), "CPU_Mapped") == 0) {
+            const uintptr_t b = (uintptr_t) t->data & ~(uintptr_t) (page - 1);
+            const uintptr_t e = ((uintptr_t) t->data + ggml_nbytes(t)) & ~(uintptr_t) (page - 1);
+            if (e > b + page) {
+                madvise((void *) (b + page), e - b - page, MADV_PAGEOUT);
+            }
+        }
+    }
+#endif
+    char * dst = (char *) mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (dst == MAP_FAILED) {
+        LLAMA_LOG_WARN("%s: LLAMA_MOE_PIN_EXPS: no anonymous memory (%s), the experts stay mapped\n", __func__, strerror(errno));
+        return;
+    }
+    const size_t huge = llama_huge_request(total);
+    if (huge > 0) {
+        madvise(dst, huge, MADV_HUGEPAGE);
+    }
+    // tensor by tensor (each read once from the file, then its file pages dropped), the tensor split over the threads
+    const int nt = std::max(1, std::min(16, (int) std::thread::hardware_concurrency()));
+    std::vector<size_t> offs;
+    size_t o = 0;
+    for (ggml_tensor * t : ts) {
+        const size_t n = ggml_nbytes(t);
+        const size_t chunk = ((n + nt - 1)/nt + page - 1) & ~(page - 1);
+        std::vector<std::thread> th;
+        for (int i = 0; i < nt; ++i) {
+            const size_t c = i*chunk;
+            if (c >= n) { break; }
+            th.emplace_back([=]() { memcpy(dst + o + c, (const char *) t->data + c, std::min(chunk, n - c)); });
+        }
+        for (auto & x : th) { x.join(); }
+        const uintptr_t b = (uintptr_t) t->data & ~(uintptr_t) (page - 1);
+        const uintptr_t e = ((uintptr_t) t->data + n) & ~(uintptr_t) (page - 1);   // whole pages inside the tensor only
+        if (e > b + page) {
+#ifdef MADV_PAGEOUT
+            madvise((void *) (b + page), e - b - page, MADV_PAGEOUT);   // out of the page cache now, not when memory runs short
+#endif
+            madvise((void *) (b + page), e - b - page, MADV_DONTNEED);
+        }
+        offs.push_back(o);
+        o += (n + page - 1) & ~(page - 1);
+    }
+    if (!reg_fn(dst, total)) {
+        LLAMA_LOG_WARN("%s: LLAMA_MOE_PIN_EXPS: FAILED to register %.2f GiB, the experts stay mapped\n", __func__, total/1073741824.0);
+        munmap(dst, total);
+        return;
+    }
+    for (size_t i = 0; i < ts.size(); ++i) {
+        ts[i]->data = dst + offs[i];
+    }
+    exps_host_copy = std::shared_ptr<void>(dst, [total, unreg_fn](void * q) { unreg_fn(q); munmap(q, total); });
+    // what the process holds in huge pages now (AnonHugePages of /proc/self/smaps_rollup): mostly this copy
+    size_t thp_kb = 0;
+    {
+        std::ifstream f("/proc/self/smaps_rollup");
+        std::string key;
+        size_t kb = 0;
+        while (f >> key) {
+            if (key == "AnonHugePages:" && f >> kb) {
+                thp_kb = kb;
+                break;
+            }
+        }
+    }
+    LLAMA_LOG_INFO("%s: LLAMA_MOE_PIN_EXPS: copied %zu expert tensors (%.2f GiB, %.2f GiB of it asked for huge pages, %.2f GiB in huge pages) to pinned anonymous memory in %.1f s\n",
+        __func__, ts.size(), total/1073741824.0, huge/1073741824.0, thp_kb/1048576.0, (ggml_time_us() - t0)/1e6);
+#endif
+}
+
+void llama_model_base::load_tensors_mtp_chain() {
+    const uint32_t il = hparams.n_layer();
+    if (getenv("LLAMA_MTP_CHAIN") == nullptr || atoi(getenv("LLAMA_MTP_CHAIN")) == 0 || arch != LLM_ARCH_QWEN4EXP ||
+            output == nullptr || output->buffer == nullptr || hparams.n_layer_nextn == 0 || layers.size() <= il ||
+            layers[il].nextn.eh_proj == nullptr) {
+        return;
+    }
+    const int n_out = 64;
+    ggml_init_params ip = { (3 + n_out)*ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx { ggml_init(ip) };
+    mtp_chain_tok = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 1);
+    mtp_chain_h   = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, hparams.n_embd_out());
+    mtp_chain_out = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, n_out);
+    ggml_set_name(mtp_chain_tok, "mtp_chain.tok");
+    ggml_set_name(mtp_chain_h,   "mtp_chain.h");
+    ggml_set_name(mtp_chain_out, "mtp_chain.out");
+    ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_buffer_get_type(output->buffer)) };
+    if (!buf) {
+        throw std::runtime_error("LLAMA_MTP_CHAIN: cannot allocate the chain buffers");
+    }
+    for (int i = 0; i < n_out; ++i) {
+        ggml_tensor * v = ggml_view_1d(ctx.get(), mtp_chain_out, 1, i*sizeof(int32_t));
+        ggml_backend_view_init(v);
+        mtp_chain_out_rows.push_back(v);
+    }
+    LLAMA_LOG_INFO("%s: MTP draft chain buffers in %s\n", __func__, ggml_backend_buffer_name(buf.get()));
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    bufs.emplace_back(std::move(buf));
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
+}
+
+// LLAMA_GDN_GATES: concatenate the GDN beta and alpha projections row-wise so one matvec computes both; each output
+// row is still its own dot product, so the values are unchanged. One zero pad row keeps the row count off the tile
+// sizes of the CUDA MMF kernel, so small batches stay on the vector kernel like the separate projections (a
+// different kernel would round differently). The originals stay for the unfused path
+void llama_model_base::load_tensors_gdn_gates() {
+    if (getenv("LLAMA_GDN_GATES") == nullptr || atoi(getenv("LLAMA_GDN_GATES")) == 0 || arch != LLM_ARCH_QWEN4EXP) {
+        return;
+    }
+    int n_done = 0;
+    size_t n_bytes = 0;
+    for (auto & layer : layers) {
+        ggml_tensor * b = layer.ssm_beta;
+        ggml_tensor * a = layer.ssm_alpha;
+        if (b == nullptr || a == nullptr || layer.ssm_beta_s || layer.ssm_alpha_s || b->type != a->type ||
+            b->ne[0] != a->ne[0] || b->ne[2] != 1 || a->ne[2] != 1 || !ggml_is_contiguous(b) || !ggml_is_contiguous(a) ||
+            b->buffer == nullptr || ggml_backend_buffer_get_type(b->buffer) != ggml_backend_buffer_get_type(a->buffer)) {
+            continue;
+        }
+        ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+        ggml_context_ptr ctx { ggml_init(ip) };
+        const int64_t n_rows = b->ne[1] + a->ne[1];
+        ggml_tensor * t = ggml_new_tensor_2d(ctx.get(), b->type, b->ne[0], n_rows + (n_rows % 2 == 0 ? 1 : 0));
+        ggml_format_name(t, "%s.cat", b->name);
+        ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_buffer_get_type(b->buffer)) };
+        if (!buf) {
+            throw std::runtime_error("LLAMA_GDN_GATES: cannot allocate the merged gate projection");
+        }
+        std::vector<uint8_t> data(ggml_nbytes(t), 0);
+        ggml_backend_tensor_get(b, data.data(), 0, ggml_nbytes(b));
+        ggml_backend_tensor_get(a, data.data() + ggml_nbytes(b), 0, ggml_nbytes(a));
+        ggml_backend_tensor_set(t, data.data(), 0, data.size());
+        layer.ssm_ba_cat = t;
+        n_done++;
+        n_bytes += ggml_nbytes(t);
+        std::vector<ggml_backend_buffer_ptr> bufs;
+        bufs.emplace_back(std::move(buf));
+        pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
+    }
+    LLAMA_LOG_INFO("%s: merged beta+alpha projections of %d layers (%.1f MiB)\n", __func__, n_done, n_bytes/1024.0/1024.0);
+}
+
+// LLAMA_HC_FUSE: fold the 1/hc scale that follows each hyper-connection down projection into its weights. Only
+// for BF16 and F32 weights with hc a power of two, where the scaling is exact (BF16 has the F32 exponent range),
+// so the products and their sums are the same as scaling the result
+void llama_model_base::load_tensors_hc_fold() {
+    if (getenv("LLAMA_HC_FUSE") == nullptr || atoi(getenv("LLAMA_HC_FUSE")) == 0 || arch != LLM_ARCH_QWEN4EXP || hparams.dsv4_hc_mult <= 1) { // only qwen4exp reads hc_scale_folded
+        return;
+    }
+    const uint32_t hc = hparams.dsv4_hc_mult;
+    if ((hc & (hc - 1)) != 0) {
+        return;
+    }
+    const float s = 1.0f / (float) hc;
+    std::vector<ggml_tensor *> ts = { hc_head_down };
+    for (auto & l : layers) {
+        ts.push_back(l.hc_attn_down);
+        ts.push_back(l.hc_ffn_down);
+        ts.push_back(l.hc_attn_down_inject); // merged by the converter: the inject rows take the same 1/hc
+        ts.push_back(l.hc_ffn_down_inject);
+        ts.push_back(l.nextn.hc_head_down);
+    }
+    size_t n_done = 0, n_skip = 0;
+    std::vector<uint8_t> buf;
+    for (ggml_tensor * t : ts) {
+        if (t == nullptr) {
+            continue;
+        }
+        if (t->type != GGML_TYPE_BF16 && t->type != GGML_TYPE_F32) {
+            n_skip++;
+            continue;
+        }
+        buf.resize(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+        const int64_t n = ggml_nelements(t);
+        if (t->type == GGML_TYPE_F32) {
+            float * p = (float *) buf.data();
+            for (int64_t i = 0; i < n; ++i) { p[i] *= s; }
+        } else {
+            ggml_bf16_t * p = (ggml_bf16_t *) buf.data();
+            for (int64_t i = 0; i < n; ++i) {
+                const float v = ggml_bf16_to_fp32(p[i]);
+                const ggml_bf16_t r = ggml_fp32_to_bf16(v * s);
+                GGML_ASSERT(ggml_bf16_to_fp32(r) == v * s && "LLAMA_HC_FUSE: the folded scale is not exact");
+                p[i] = r;
+            }
+        }
+        ggml_backend_tensor_set(t, buf.data(), 0, buf.size());
+        hc_scale_folded.insert(t);
+        n_done++;
+    }
+    LLAMA_LOG_INFO("%s: folded 1/%u into %zu hyper-connection down projections (%zu left as they are: not BF16/F32)\n",
+        __func__, hc, n_done, n_skip);
+}
+
+// an MTP draft model may score only a subset of the vocabulary: its head reads N rows of output instead of n_vocab,
+// and a token outside the subset is never drafted (the target still verifies every token, so the output is the same)
+void llama_model_base::load_tensors_draft_vocab() {
+    const char * path = getenv("LLAMA_MTP_DRAFT_VOCAB");
+    const uint32_t il = hparams.n_layer();
+    if (path == nullptr || output == nullptr || hparams.n_layer_nextn == 0 || layers.size() <= il || layers[il].nextn.eh_proj == nullptr) {
+        return;
+    }
+    // a number N: the first N token ids (BPE ids come roughly in merge-frequency order) plus every control and
+    // user-defined token; otherwise a file of int32 token ids
+    std::vector<int32_t> ids;
+    char * end = nullptr;
+    const long n_first = strtol(path, &end, 10);
+    if (end != path && *end == '\0') {
+        for (int32_t id = 0; id < (int32_t) output->ne[1]; ++id) {
+            const auto attr = vocab.token_get_attr(id);
+            if (id < n_first || (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED))) {
+                ids.push_back(id);
+            }
+        }
+    } else {
+        FILE * f = fopen(path, "rb");
+        if (f == nullptr) {
+            throw std::runtime_error(format("LLAMA_MTP_DRAFT_VOCAB: cannot open %s", path));
+        }
+        int32_t id;
+        while (fread(&id, sizeof(id), 1, f) == 1) {
+            if (id < 0 || id >= output->ne[1]) {
+                fclose(f);
+                throw std::runtime_error(format("LLAMA_MTP_DRAFT_VOCAB: token id %d out of range", id));
+            }
+            ids.push_back(id);
+        }
+        fclose(f);
+    }
+    const int64_t n = (int64_t) ids.size();
+    GGML_ASSERT(n > 0);
+
+    ggml_init_params ip = { 2*ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx { ggml_init(ip) };
+    output_draft     = ggml_new_tensor_2d(ctx.get(), output->type, output->ne[0], n);
+    output_draft_ids = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, n);
+    ggml_set_name(output_draft, "output_draft.weight");
+    ggml_set_name(output_draft_ids, "output_draft.ids");
+    // next to the MTP layer (on the GPU), so that the full head can stay in host memory (-otd "output\.weight=CPU")
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(layers[il].nextn.eh_proj->buffer);
+    ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+    if (!buf) {
+        throw std::runtime_error("LLAMA_MTP_DRAFT_VOCAB: cannot allocate the draft head");
+    }
+    const size_t row = output->nb[1];
+    std::vector<uint8_t> data(n*row);
+    for (int64_t i = 0; i < n; ++i) {
+        ggml_backend_tensor_get(output, data.data() + i*row, (size_t) ids[i]*row, row);
+    }
+    ggml_backend_tensor_set(output_draft, data.data(), 0, data.size());
+    ggml_backend_tensor_set(output_draft_ids, ids.data(), 0, n*sizeof(int32_t));
+    LLAMA_LOG_INFO("%s: MTP draft head over %lld of %lld tokens from %s (%.1f MiB in %s, full head %.1f MiB)\n", __func__,
+        (long long) n, (long long) output->ne[1], path, ggml_nbytes(output_draft)/1024.0/1024.0, ggml_backend_buffer_name(buf.get()), ggml_nbytes(output)/1024.0/1024.0);
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    bufs.emplace_back(std::move(buf));
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
